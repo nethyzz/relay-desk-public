@@ -1,0 +1,71 @@
+{
+  "repository": "chen-006/meow-llm-detector",
+  "engine_ref": "c56dc0691e53d3a567a7f675ed9a23d878294636",
+  "engine_version": "4.5.4",
+  "baselines": {
+    "gpt": {
+      "id": "meow-gpt-other-cap98-efficient",
+      "version": "4.5.4-predictive.20261003.1",
+      "sha256": "9273dc33374e8be234a950437f4b7238228fbe096f051b1f210e46297c612362",
+      "counts": {
+        "low": 32,
+        "medium": 64,
+        "high": 128
+      }
+    },
+    "claude": {
+      "id": "meow-claude-other-cap98-efficient",
+      "version": "4.5.4-predictive.20260924.1",
+      "sha256": "df005a15ef72cc805b57fd0caf8c8f6b99496ca37d73c6cc759adaa43158ef8c",
+      "counts": {
+        "low": 48,
+        "medium": 72,
+        "high": 120
+      }
+    },
+    "gpt-chat": {
+      "id": "meow-gpt-chat-compatible",
+      "version": "4.5.4-chat.20261003.1",
+      "sha256": "7510f4901b741a592f889f7bd2926cfd74e5d5919875279e8056f5e74cf709c7",
+      "counts": {
+        "low": 32,
+        "medium": 64,
+        "high": 128
+      }
+    },
+    "claude-chat": {
+      "id": "meow-claude-chat-compatible",
+      "version": "4.5.4-chat.20260924.1",
+      "sha256": "db6728ff00d28f58ed21079ce66a82f70ba226a6530c52c5630fddd5cbf963da",
+      "counts": {
+        "low": 48,
+        "medium": 72,
+        "high": 120
+      }
+    }
+  },
+  "engine_archive_sha256": "f5b1cb73bddf1a83625ed09e7246fb5202ddf37a626ed554dc2937f35f761dfc",
+  "baselines_ref": "dc608d5c097abf96575d5b34f49952ddbd27c281",
+  "archived_baselines": {
+    "gpt-sol": {
+      "id": "meow-gpt-other-cap98-efficient",
+      "version": "4.5.4-predictive.20260924.2",
+      "sha256": "98f8d12c83100352addf44db15d8b57aa183338a4fb5f83ba30ffdbc06d78612",
+      "counts": {
+        "low": 32,
+        "medium": 64,
+        "high": 128
+      }
+    },
+    "gpt-sol-chat": {
+      "id": "meow-gpt-chat-compatible",
+      "version": "4.5.4-chat.20260924.2",
+      "sha256": "5c835e5b6646359e33f3f56663b712f214eaa7eda1108088f3a3764bc0b4db72",
+      "counts": {
+        "low": 32,
+        "medium": 64,
+        "high": 128
+      }
+    }
+  }
+}

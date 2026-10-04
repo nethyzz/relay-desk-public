@@ -1,0 +1,47 @@
+{
+  "name": "relay-desk",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "tsc --noEmit && vite build",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:python": "node scripts/python.mjs -m unittest discover -s tests -p test_*.py",
+    "upstream:install": "node scripts/python.mjs scripts/bootstrap_upstream.py",
+    "deploy": "node scripts/deploy.mjs",
+    "deploy:check": "node scripts/deploy-check.mjs",
+    "setup:local": "node scripts/setup-local.mjs",
+    "configure": "node scripts/configure.mjs",
+    "configure:login": "node --experimental-strip-types scripts/configure-login.mjs",
+    "migrate:local": "node --experimental-strip-types scripts/migrate-local.mjs"
+  },
+  "dependencies": {
+    "lucide-react": "0.468.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.2",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "typescript": "5.9.3",
+    "undici": "7.29.1",
+    "vite": "7.3.6",
+    "wrangler": "4.146.0"
+  },
+  "description": "Private model fingerprint monitoring dashboard powered by the original meow LLM Detector.",
+  "author": "nethyzz",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nethyzz/relay-desk-public.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nethyzz/relay-desk-public/issues"
+  },
+  "homepage": "https://github.com/nethyzz/relay-desk-public#readme",
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

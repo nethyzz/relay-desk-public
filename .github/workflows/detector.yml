@@ -1,0 +1,38 @@
+name: Private model detector
+on:
+  workflow_dispatch:
+    inputs:
+      batch_id:
+        description: Private panel batch ID (no credentials)
+        required: true
+        type: string
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PANEL_ORIGIN: ${{ vars.PANEL_ORIGIN }}
+      BATCH_ID: ${{ inputs.batch_id }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Record billed execution start
+        run: echo "WORKFLOW_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: runner/requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: .vendor
+          key: original-meow-${{ hashFiles('runner/upstream.json', 'scripts/bootstrap_upstream.py') }}
+      - name: Install original detector dependencies
+        run: python -m pip install -r runner/requirements.txt
+      - name: Verify original detector and frozen benchmarks
+        run: python scripts/bootstrap_upstream.py
+      - name: Execute and save private reports
+        run: python runner/execute.py
