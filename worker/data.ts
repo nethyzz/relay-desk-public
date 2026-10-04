@@ -1,4 +1,4 @@
-import { BASELINES, baselineFor, type Limits, type Run, type RunSnapshot, type Protocol, type Tier } from '../src/shared.ts';
+import { BASELINES, DETECTION_BATCH_SIZE, baselineFor, type Limits, type Run, type RunSnapshot, type Protocol, type Tier } from '../src/shared.ts';
 import { ApiError, type Env } from './types.ts';
 import { decrypt, encrypt, randomToken, digest, verifyOidc } from './security.ts';
 import { manualMailEnabled, requestPlan, shanghaiDay, shanghaiMonth, safeReport } from './domain.ts';
@@ -20,14 +20,29 @@ export async function panel(env: Env) {
   rows(env, 'SELECT * FROM groups ORDER BY created_at'),
   rows(env, 'SELECT id,group_id,name,station_name,base_url,created_at,updated_at FROM endpoints ORDER BY created_at'),
   rows(env, 'SELECT * FROM targets ORDER BY created_at'), rows(env, 'SELECT * FROM schedules'),
-  rows(env, 'SELECT * FROM runs ORDER BY created_at DESC LIMIT 200'), setting<Limits>(env, 'limits'), setting<Row>(env, 'mail'), usage(env),
+  rows(env, `WITH applicable AS (
+   SELECT r.id,r.status,
+    ROW_NUMBER() OVER(PARTITION BY r.target_id ORDER BY r.created_at DESC,r.id DESC) AS latest,
+    ROW_NUMBER() OVER(PARTITION BY r.target_id,r.status NOT IN ('queued','running') ORDER BY r.created_at DESC,r.id DESC) AS last_finished,
+    ROW_NUMBER() OVER(PARTITION BY r.target_id,r.status NOT IN ('queued','running','cancelled') ORDER BY r.created_at DESC,r.id DESC) AS last_evidence
+   FROM runs r JOIN targets t ON t.id=r.target_id JOIN endpoints e ON e.id=t.endpoint_id
+   WHERE json_extract(r.snapshot,'$.endpoint_id')=e.id AND json_extract(r.snapshot,'$.base_url')=e.base_url
+    AND json_extract(r.snapshot,'$.protocol')=t.protocol AND json_extract(r.snapshot,'$.request_model')=t.request_model
+    AND json_extract(r.snapshot,'$.claimed_model')=t.claimed_model
+  ) SELECT * FROM runs WHERE status IN ('queued','running')
+   OR id IN (SELECT id FROM runs ORDER BY created_at DESC LIMIT 200)
+   OR id IN (SELECT id FROM applicable WHERE latest=1 OR (last_finished=1 AND status NOT IN ('queued','running')) OR (last_evidence=1 AND status NOT IN ('queued','running','cancelled')))
+   OR id IN (SELECT m.run_id FROM run_set_members m JOIN run_sets s ON s.id=m.set_id WHERE s.superseded_by IS NULL AND
+    (s.ended_at IS NULL OR s.id IN (SELECT id FROM run_sets WHERE superseded_by IS NULL ORDER BY created_at DESC LIMIT 20)))
+   ORDER BY created_at DESC`), setting<Limits>(env, 'limits'), setting<Row>(env, 'mail'), usage(env),
   row(env, "SELECT error FROM notices WHERE status IN ('sent','failed') ORDER BY created_at DESC LIMIT 1"),
   row(env, "SELECT id,status,created_at,sent_at,error FROM notices WHERE kind='test' ORDER BY created_at DESC LIMIT 1"),
   rows(env, `SELECT s.id,s.source,s.created_at,s.ended_at,
    (SELECT json_group_array(run_id) FROM run_set_members WHERE set_id=s.id) AS run_ids,
    (SELECT json_object('id',n.id,'status',n.status,'created_at',n.created_at,'sent_at',n.sent_at,'error',n.error)
     FROM notices n WHERE n.kind='batch' AND n.reference='set:'||s.id ORDER BY n.created_at DESC LIMIT 1) AS notice
-   FROM run_sets s WHERE s.superseded_by IS NULL ORDER BY s.created_at DESC LIMIT 20`),
+   FROM run_sets s WHERE s.superseded_by IS NULL AND (s.ended_at IS NULL OR s.id IN
+    (SELECT id FROM run_sets WHERE superseded_by IS NULL ORDER BY created_at DESC LIMIT 20)) ORDER BY s.created_at DESC`),
   rows(env, 'SELECT * FROM run_presets ORDER BY created_at,id'),
   rows(env, 'SELECT preset_id,target_id FROM run_preset_targets ORDER BY preset_id,position,target_id'),
  ]);
@@ -39,70 +54,80 @@ async function attachRunSet(env: Env, runIds: string[], source: string) {
  const setId = await digest(JSON.stringify([source, unique]));
  const existing = await row(env, `SELECT s.id FROM run_sets s WHERE s.source=? AND
   (SELECT COUNT(*) FROM run_set_members WHERE set_id=s.id)=? AND NOT EXISTS(
-   SELECT 1 FROM run_set_members WHERE set_id=s.id AND run_id NOT IN (${unique.map(() => '?').join(',')})
-  ) ORDER BY s.created_at DESC LIMIT 1`, source, unique.length, ...unique);
+   SELECT 1 FROM run_set_members WHERE set_id=s.id AND run_id NOT IN (SELECT value FROM json_each(?))
+  ) ORDER BY s.created_at DESC LIMIT 1`, source, unique.length, JSON.stringify(unique));
  if (existing) return existing.id as string;
  await env.DB.batch([
   env.DB.prepare('INSERT OR IGNORE INTO run_sets(id,source,created_at) VALUES (?,?,?)').bind(setId, source, Date.now()),
-  ...unique.map(runId => env.DB.prepare('INSERT OR IGNORE INTO run_set_members(set_id,run_id) VALUES (?,?)').bind(setId, runId)),
+  env.DB.prepare('INSERT OR IGNORE INTO run_set_members(set_id,run_id) SELECT ?,value FROM json_each(?)').bind(setId, JSON.stringify(unique)),
   // A larger selection subsumes an unsent selection of the same active runs.
   env.DB.prepare(`UPDATE run_sets SET superseded_by=? WHERE id!=? AND source=? AND superseded_by IS NULL AND
    (ended_at IS NULL OR EXISTS(SELECT 1 FROM notices WHERE reference='set:'||run_sets.id AND status='pending')) AND
-   NOT EXISTS(SELECT 1 FROM run_set_members WHERE set_id=run_sets.id AND run_id NOT IN (${unique.map(() => '?').join(',')}))`
-  ).bind(setId, setId, source, ...unique),
+   NOT EXISTS(SELECT 1 FROM run_set_members WHERE set_id=run_sets.id AND run_id NOT IN (SELECT value FROM json_each(?)))`
+  ).bind(setId, setId, source, JSON.stringify(unique)),
   env.DB.prepare("UPDATE notices SET status='cancelled' WHERE kind='batch' AND status='pending' AND reference IN (SELECT 'set:'||id FROM run_sets WHERE superseded_by=?)").bind(setId),
  ]);
  await finalizeRunSets(env, setId);
  return setId;
 }
-export async function createRuns(env: Env, targetIds: string[], overrideTier?: Tier, source = 'manual', tiers: Record<string, Tier> = {}, raceRetries = 2): Promise<{ runId: string; runIds: string[]; setId: string; reused: boolean }> {
+export async function createRuns(env: Env, targetIds: string[], overrideTier?: Tier, source = 'manual', tiers: Record<string, Tier> = {}, raceRetries = 2): Promise<{ runId: string; batchIds: string[]; runIds: string[]; setId: string; reused: boolean }> {
+ targetIds = [...new Set(targetIds)];
+ if (!targetIds.length) throw new ApiError('请至少选择一个检测目标');
  if (!executionReady(env)) throw new ApiError('检测执行器尚未连接。请先完成部署或安装本地原检测器。', 503);
- const active = await rows(env, `SELECT * FROM runs WHERE target_id IN (${targetIds.map(() => '?').join(',')}) AND status IN ('queued','running')`, ...targetIds);
+ const active = await rows(env, "SELECT * FROM runs WHERE target_id IN (SELECT value FROM json_each(?)) AND status IN ('queued','running')", JSON.stringify(targetIds));
  const remaining = targetIds.filter(target => !active.some(r => r.target_id === target));
  if (!remaining.length) {
   const runIds = active.map(r => r.id); const setId = await attachRunSet(env, runIds, source);
-  return { runId: active[0].batch_id, runIds, setId, reused: true };
+  return { runId: active[0].batch_id, batchIds: [...new Set(active.map(r => r.batch_id))], runIds, setId, reused: true };
  }
- const selected = await rows(env, `SELECT t.*,e.name AS endpoint_name,e.station_name,e.base_url,e.key_cipher,e.group_id,g.name AS group_name FROM targets t JOIN endpoints e ON t.endpoint_id=e.id JOIN groups g ON e.group_id=g.id WHERE t.id IN (${remaining.map(() => '?').join(',')})`, ...remaining);
+ const selected = await rows(env, 'SELECT t.*,e.name AS endpoint_name,e.station_name,e.base_url,e.key_cipher,e.group_id,g.name AS group_name FROM targets t JOIN endpoints e ON t.endpoint_id=e.id JOIN groups g ON e.group_id=g.id WHERE t.id IN (SELECT value FROM json_each(?))', JSON.stringify(remaining));
  if (selected.length !== remaining.length) throw new ApiError('检测目标不存在', 404);
- const batchId = id(); const now = Date.now(); const day = shanghaiDay(now); const month = shanghaiMonth(now);
- const frozen: { runId: string; target: string; snapshot: RunSnapshot; key: string; maximum: number }[] = [];
+ const order = new Map(remaining.map((target, index) => [target, index])); selected.sort((a, b) => order.get(a.id)! - order.get(b.id)!);
+ const batchIds = Array.from({ length: Math.ceil(selected.length / DETECTION_BATCH_SIZE) }, () => id());
+ const now = Date.now(); const day = shanghaiDay(now); const month = shanghaiMonth(now);
+ const frozen: { runId: string; batchId: string; target: string; snapshot: RunSnapshot; key: string; maximum: number }[] = [];
+ const secrets = new Map<string, string>();
  for (const t of selected) {
   const protocol = t.protocol as Protocol; const baseline = BASELINES[protocol] ? baselineFor(protocol, t.claimed_model) : null; const tier = tiers[t.id] || overrideTier || t.tier as Tier;
   if (!baseline || !baseline.models.includes(t.claimed_model)) throw new ApiError(`${t.name} 暂无对应基准，不能判定此模型`);
   const p = requestPlan(protocol, tier); const runId = id();
-  const secret = await decrypt(t.key_cipher, env, 'endpoint:' + t.endpoint_id);
-  frozen.push({ runId, target: t.id, maximum: p.maximum, key: await encrypt(secret, env, 'run:' + runId), snapshot: { target_name: t.name, station_name: t.station_name, endpoint_name: t.station_name === t.endpoint_name ? t.endpoint_name : `${t.station_name} / ${t.endpoint_name}`, base_url: t.base_url, group_name: t.group_name, endpoint_id: t.endpoint_id, protocol, request_model: t.request_model, claimed_model: t.claimed_model, tier, baseline_id: baseline.id, baseline_version: baseline.version, baseline_sha256: baseline.sha256, logical_requests: p.logical, retry_budget: p.retry } });
+  if (!secrets.has(t.endpoint_id)) secrets.set(t.endpoint_id, await decrypt(t.key_cipher, env, 'endpoint:' + t.endpoint_id));
+  frozen.push({ runId, batchId: batchIds[Math.floor(frozen.length / DETECTION_BATCH_SIZE)], target: t.id, maximum: p.maximum, key: await encrypt(secrets.get(t.endpoint_id)!, env, 'run:' + runId), snapshot: { target_name: t.name, station_name: t.station_name, endpoint_name: t.station_name === t.endpoint_name ? t.endpoint_name : `${t.station_name} / ${t.endpoint_name}`, base_url: t.base_url, group_name: t.group_name, endpoint_id: t.endpoint_id, protocol, request_model: t.request_model, claimed_model: t.claimed_model, tier, baseline_id: baseline.id, baseline_version: baseline.version, baseline_sha256: baseline.sha256, logical_requests: p.logical, retry_budget: p.retry } });
  }
  const limits = await setting<Limits>(env, 'limits'); const maximum = frozen.reduce((sum, r) => sum + r.maximum, 0);
- const requestReservation = batchId + ':requests'; const minuteReservation = batchId + ':minutes';
+ const requestReservation = batchIds[0] + ':requests';
+ const batches = batchIds.map((batchId, index) => ({ id: batchId, created_at: now + index, maximum: 0 }));
+ for (const [index, run] of frozen.entries()) batches[Math.floor(index / DETECTION_BATCH_SIZE)].maximum += run.maximum;
+ // One transaction reserves the whole selection, then creates bounded runner
+ // batches. JSON inserts avoid per-target SQL queries and D1 binding limits.
  const statements = [
-  env.DB.prepare("INSERT INTO quota_reservations SELECT ?,'requests',?,? WHERE (SELECT COALESCE(SUM(amount),0) FROM quota_reservations WHERE kind='requests' AND period=?)+?<=?").bind(requestReservation, day, maximum, day, maximum, limits.daily_requests),
-  env.DB.prepare("INSERT INTO quota_reservations SELECT ?,'minutes',?,15 WHERE EXISTS(SELECT 1 FROM quota_reservations WHERE id=?) AND (SELECT COALESCE(SUM(amount),0) FROM quota_reservations WHERE kind='minutes' AND period=?)+15<=?").bind(minuteReservation, month, requestReservation, month, limits.monthly_minutes),
-  env.DB.prepare("INSERT INTO batches(id,created_at) SELECT ?,? WHERE EXISTS(SELECT 1 FROM quota_reservations WHERE id=?)").bind(batchId, now, minuteReservation),
-  ...frozen.map(r => env.DB.prepare("INSERT INTO runs(id,batch_id,target_id,source,created_at,snapshot,key_cipher,reserved_attempts,quota_day) SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM batches WHERE id=?)").bind(r.runId, batchId, r.target, source, now, JSON.stringify(r.snapshot), r.key, r.maximum, day, batchId)),
-  env.DB.prepare('DELETE FROM quota_reservations WHERE id=? AND NOT EXISTS(SELECT 1 FROM batches WHERE id=?)').bind(requestReservation, batchId),
+  env.DB.prepare("INSERT INTO quota_reservations SELECT ?,'requests',?,? WHERE (SELECT COALESCE(SUM(amount),0) FROM quota_reservations WHERE kind='requests' AND period=?)+?<=? AND (SELECT COALESCE(SUM(amount),0) FROM quota_reservations WHERE kind='minutes' AND period=?)+?<=?").bind(requestReservation, day, batches[0].maximum, day, maximum, limits.daily_requests, month, batches.length * 15, limits.monthly_minutes),
+  env.DB.prepare("INSERT INTO quota_reservations SELECT json_extract(value,'$.id')||':requests','requests',?,json_extract(value,'$.maximum') FROM json_each(?) WHERE json_extract(value,'$.id')!=? AND EXISTS(SELECT 1 FROM quota_reservations WHERE id=?)").bind(day, JSON.stringify(batches), batchIds[0], requestReservation),
+  env.DB.prepare("INSERT INTO quota_reservations SELECT json_extract(value,'$.id')||':minutes','minutes',?,15 FROM json_each(?) WHERE EXISTS(SELECT 1 FROM quota_reservations WHERE id=?)").bind(month, JSON.stringify(batches), requestReservation),
+  env.DB.prepare("INSERT INTO batches(id,created_at) SELECT json_extract(value,'$.id'),json_extract(value,'$.created_at') FROM json_each(?) WHERE EXISTS(SELECT 1 FROM quota_reservations WHERE id=?)").bind(JSON.stringify(batches), requestReservation),
+  env.DB.prepare("INSERT INTO runs(id,batch_id,target_id,source,created_at,snapshot,key_cipher,reserved_attempts,quota_day) SELECT json_extract(value,'$.runId'),json_extract(value,'$.batchId'),json_extract(value,'$.target'),?,?,json_extract(value,'$.snapshot'),json_extract(value,'$.key'),json_extract(value,'$.maximum'),? FROM json_each(?) WHERE EXISTS(SELECT 1 FROM quota_reservations WHERE id=?)").bind(source, now, day, JSON.stringify(frozen), requestReservation),
  ];
  try { await env.DB.batch(statements); } catch (error) {
   // 数据库唯一索引负责并发去重；整批事务失败时预算也回滚。
   if (String(error).includes('UNIQUE')) {
-   const concurrent = await rows(env, `SELECT * FROM runs WHERE target_id IN (${targetIds.map(() => '?').join(',')}) AND status IN ('queued','running')`, ...targetIds);
+   const concurrent = await rows(env, "SELECT * FROM runs WHERE target_id IN (SELECT value FROM json_each(?)) AND status IN ('queued','running')", JSON.stringify(targetIds));
    if (concurrent.length === targetIds.length) {
     const runIds = concurrent.map(r => r.id); const setId = await attachRunSet(env, runIds, source);
-    return { runId: concurrent[0].batch_id, runIds, setId, reused: true };
+    return { runId: concurrent[0].batch_id, batchIds: [...new Set(concurrent.map(r => r.batch_id))], runIds, setId, reused: true };
    }
    if (raceRetries > 0) return createRuns(env, targetIds, overrideTier, source, tiers, raceRetries - 1);
    throw new ApiError('检测任务正在更新，请稍后重试；已有任务会继续运行。', 409);
   }
   throw error;
  }
- if (!await row(env, 'SELECT id FROM batches WHERE id=?', batchId)) throw new ApiError('用量上限不足，已暂停新检测。可调整预算或等待额度重置。', 429);
+ if (!await row(env, 'SELECT id FROM batches WHERE id=?', batchIds[0])) throw new ApiError('用量上限不足，已暂停新检测。可调整预算或等待额度重置。', 429);
  const runIds = [...active.map(r => r.id), ...frozen.map(r => r.runId)]; const setId = await attachRunSet(env, runIds, source);
- return { runId: batchId, runIds, setId, reused: false };
+ return { runId: batchIds[0], batchIds, runIds, setId, reused: false };
 }
 export async function dispatch(env: Env, batchId: string) {
  if (env.DEV_MODE === 'local') return;
- const reserved = await env.DB.prepare("UPDATE batches SET status='dispatched',dispatched_at=?,last_dispatch_error=NULL WHERE id=? AND status='queued'").bind(Date.now(), batchId).run();
+ const now = Date.now();
+ const reserved = await env.DB.prepare("UPDATE batches SET status='dispatched',dispatched_at=?,dispatch_started_at=COALESCE(dispatch_started_at,?),last_dispatch_error=NULL WHERE id=? AND status='queued' AND NOT EXISTS(SELECT 1 FROM batches occupied WHERE occupied.id!=? AND occupied.status IN ('dispatched','running'))").bind(now, now, batchId, batchId).run();
  if (!reserved.meta.changes) return;
  try {
   const response = await fetch(`https://api.github.com/repos/${env.GITHUB_REPOSITORY}/actions/workflows/${env.GITHUB_WORKFLOW || 'detector.yml'}/dispatches`, { method: 'POST', headers: { Authorization: `Bearer ${env.GITHUB_DISPATCH_TOKEN}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'Relay-Desk', 'X-GitHub-Api-Version': '2022-11-28' }, body: JSON.stringify({ ref: (env.GITHUB_REF || 'refs/heads/main').replace('refs/heads/', ''), inputs: { batch_id: batchId } }), signal: AbortSignal.timeout(15000) });
@@ -110,6 +135,11 @@ export async function dispatch(env: Env, batchId: string) {
  } catch (error) {
   await env.DB.prepare("UPDATE batches SET status='queued',last_dispatch_error=? WHERE id=? AND status='dispatched'").bind(error instanceof Error && error.message.startsWith('GitHub') ? error.message : '暂时无法连接 GitHub 执行器，稍后自动重试。', batchId).run();
  }
+}
+export async function dispatchQueued(env: Env) {
+ if (env.DEV_MODE === 'local') return;
+ const next = await row(env, "SELECT id FROM batches WHERE status='queued' AND (dispatched_at IS NULL OR dispatched_at<?) ORDER BY created_at,rowid LIMIT 1", Date.now() - 5 * 60000);
+ if (next) await dispatch(env, next.id);
 }
 export async function claim(request: Request, env: Env, batchId: string) {
  const identity = await verifyOidc(request, env); const batch = await row(env, 'SELECT * FROM batches WHERE id=?', batchId);
@@ -124,14 +154,17 @@ export async function claim(request: Request, env: Env, batchId: string) {
  ]);
  const reserved = await row(env, "SELECT COUNT(*) AS n FROM quota_reservations WHERE (id=? AND period=?) OR (id=? AND period=?)", batchId + ':requests', shanghaiDay(now), batchId + ':minutes', shanghaiMonth(now));
  if (reserved!.n !== (batch.kind === 'mail' ? 1 : 2)) throw new ApiError('当期预算不足，任务尚未开始。', 429);
- const result = await env.DB.prepare("UPDATE batches SET status='running',started_at=?,heartbeat_at=?,claimed_by=?,lease_hash=?,lease_until=? WHERE id=? AND status IN ('queued','dispatched')").bind(now, now, String(identity.run_id), await digest(lease), now + 15 * 60000, batchId).run();
- if (!result.meta.changes) throw new ApiError('任务已由其他执行器领取', 409);
+ const result = await env.DB.prepare("UPDATE batches SET status='running',started_at=?,heartbeat_at=?,claimed_by=?,lease_hash=?,lease_until=? WHERE id=? AND status IN ('queued','dispatched') AND NOT EXISTS(SELECT 1 FROM batches occupied WHERE occupied.id!=? AND occupied.status IN ('dispatched','running'))").bind(now, now, String(identity.run_id), await digest(lease), now + 15 * 60000, batchId, batchId).run();
+ if (!result.meta.changes) {
+  if (['completed', 'failed'].includes((await row(env, 'SELECT status FROM batches WHERE id=?', batchId))?.status)) return { done: true };
+  throw new ApiError('任务已被领取或前一批尚未结束，请等待排队。', 409);
+ }
  if (batch.kind === 'mail') return { batch_id: batchId, lease, kind: 'mail', mail: await mailCredential(env), notices: JSON.parse(batch.mail_payload || '[]') };
  await env.DB.prepare("UPDATE runs SET status='running',started_at=? WHERE batch_id=? AND status='queued'").bind(now, batchId).run();
- const tasks = await rows(env, 'SELECT * FROM runs WHERE batch_id=?', batchId);
+ const tasks = await rows(env, "SELECT * FROM runs WHERE batch_id=? AND status='running'", batchId);
  await env.DB.prepare('UPDATE runs SET quota_day=? WHERE batch_id=?').bind(shanghaiDay(now), batchId).run();
  const jobs = [];
- for (const task of tasks) jobs.push({ id: task.id, config: JSON.parse(task.snapshot), api_key: await decrypt(task.key_cipher, env, 'run:' + task.id), maximum_attempts: task.reserved_attempts });
+ for (const task of tasks) jobs.push({ id: task.id, config: JSON.parse(task.snapshot), api_key: await decrypt(task.key_cipher, env, 'run:' + task.id), maximum_attempts: task.reserved_attempts, stop_requested: task.stop_requested_at !== null });
  return { batch_id: batchId, lease, kind: 'detection', jobs, timeout_seconds: 600 };
 }
 export async function requireLease(request: Request, env: Env, batchId: string) {
@@ -148,17 +181,43 @@ export async function mailCredential(env: Env) {
 export async function reconcileRequests(env: Env, batchId: string) {
  await env.DB.prepare("UPDATE quota_reservations SET amount=(SELECT COALESCE(SUM(CASE WHEN status IN ('queued','running') THEN reserved_attempts ELSE attempts END),0) FROM runs WHERE batch_id=?) WHERE id=?").bind(batchId, batchId + ':requests').run();
 }
+export async function stopRuns(env: Env, runIds: string[]) {
+ const selection = JSON.stringify(runIds);
+ const selected = await rows(env, 'SELECT id,batch_id FROM runs WHERE id IN (SELECT value FROM json_each(?))', selection);
+ if (selected.length !== runIds.length) throw new ApiError('检测任务不存在，请刷新后重试', 404);
+ const now = Date.now();
+ // Stop the exact runs the user saw. Queued runs have no provider requests;
+ // running runs keep their lease, credential and reservation until runner ACK.
+ await env.DB.batch([
+  env.DB.prepare("UPDATE runs SET stop_requested_at=COALESCE(stop_requested_at,?),status='cancelled',ended_at=?,attempts=0,key_cipher='',error=NULL WHERE id IN (SELECT value FROM json_each(?)) AND status='queued'").bind(now, now, selection),
+  env.DB.prepare("UPDATE runs SET stop_requested_at=COALESCE(stop_requested_at,?) WHERE id IN (SELECT value FROM json_each(?)) AND status='running'").bind(now, selection),
+  // A dispatched workflow can still start and immediately exit. Retain its
+  // minute reservation conservatively; a never-dispatched batch costs zero.
+  env.DB.prepare("UPDATE batches SET status='completed',ended_at=?,used_minutes=CASE WHEN status='queued' THEN 0 ELSE reserved_minutes END WHERE id IN (SELECT batch_id FROM runs WHERE id IN (SELECT value FROM json_each(?))) AND status IN ('queued','dispatched') AND NOT EXISTS(SELECT 1 FROM runs WHERE batch_id=batches.id AND status IN ('queued','running'))").bind(now, selection),
+  env.DB.prepare("UPDATE quota_reservations SET amount=0 WHERE id IN (SELECT id||':minutes' FROM batches WHERE status='completed' AND used_minutes=0 AND id IN (SELECT batch_id FROM runs WHERE id IN (SELECT value FROM json_each(?))))").bind(selection),
+  env.DB.prepare("UPDATE quota_reservations SET amount=(SELECT COALESCE(SUM(CASE WHEN status IN ('queued','running') THEN reserved_attempts ELSE attempts END),0) FROM runs WHERE batch_id=substr(quota_reservations.id,1,length(quota_reservations.id)-9)) WHERE kind='requests' AND id IN (SELECT batch_id||':requests' FROM runs WHERE id IN (SELECT value FROM json_each(?)))").bind(selection),
+ ]);
+ await finalizeRunSets(env);
+ const states = await rows(env, 'SELECT id,status,stop_requested_at FROM runs WHERE id IN (SELECT value FROM json_each(?))', selection);
+ return { runs: states, stopped: states.filter(run => run.status === 'cancelled').length, stopping: states.filter(run => run.status === 'running' && run.stop_requested_at !== null).length };
+}
 export async function finishRun(env: Env, batchId: string, runId: string, body: Row) {
  const run = await row(env, 'SELECT * FROM runs WHERE id=? AND batch_id=?', runId, batchId);
  if (!run) throw new ApiError('任务不存在', 404);
  if (!['queued', 'running'].includes(run.status)) { await finalizeRunSets(env); return { ok: true, reused: true }; }
  const secret = await decrypt(run.key_cipher, env, 'run:' + run.id);
  const report = body.report ? safeReport(body.report, [secret]) : null;
- const status = ['completed', 'failed', 'timed_out'].includes(body.status) ? body.status : 'failed';
+ if (body.status === 'cancelled' && run.stop_requested_at === null) throw new ApiError('此任务尚未申请停止', 409);
+ const status = ['completed', 'failed', 'timed_out', 'cancelled'].includes(body.status) ? body.status : 'failed';
  const attempts = Number.isSafeInteger(body.attempts) && body.attempts >= 0 && body.attempts <= run.reserved_attempts ? body.attempts : run.reserved_attempts;
  const issue = reportIssues(report, status)[0];
  const error = status === 'timed_out' ? '检测超过 10 分钟，已保存有效样本。' : status === 'failed' ? issue?.summary || '检测未完成，请查看报告中的错误摘要。' : null;
- await env.DB.prepare("UPDATE runs SET status=?,ended_at=?,report=?,attempts=?,error=?,key_cipher='' WHERE id=? AND status IN ('queued','running')").bind(status, Date.now(), report ? JSON.stringify(report) : null, attempts, error, runId).run();
+ // Check the stop flag inside the write: a stop arriving during final result
+ // processing must not be overwritten by a late success or failure response.
+ await env.DB.prepare(`UPDATE runs SET status=CASE WHEN stop_requested_at IS NOT NULL THEN 'cancelled' ELSE ? END,ended_at=?,
+  report=CASE WHEN stop_requested_at IS NOT NULL AND COALESCE(?,report) IS NOT NULL THEN json_set(COALESCE(?,report),'$.operational_status','paused') ELSE COALESCE(?,report) END,
+  attempts=?,error=CASE WHEN stop_requested_at IS NOT NULL THEN NULL ELSE ? END,key_cipher=''
+  WHERE id=? AND status IN ('queued','running')`).bind(status, Date.now(), report ? JSON.stringify(report) : null, report ? JSON.stringify(report) : null, report ? JSON.stringify(report) : null, attempts, error, runId).run();
  await reconcileRequests(env, batchId);
  await finalizeRunSets(env);
  return { ok: true };
@@ -176,11 +235,11 @@ export async function finishBatch(env: Env, batchId: string, minutes: number) {
  return { ok: true };
 }
 export async function expireBatches(env: Env) {
- const expired = await rows(env, "SELECT id,status,kind,mail_payload FROM batches WHERE (status='running' AND lease_until<?) OR (status IN ('queued','dispatched') AND created_at<?)", Date.now() - 120000, Date.now() - 30 * 60000);
+ const expired = await rows(env, "SELECT id,status,kind,mail_payload FROM batches WHERE (status='running' AND lease_until<?) OR (status IN ('queued','dispatched') AND (status='dispatched' OR last_dispatch_error IS NOT NULL) AND COALESCE(dispatch_started_at,dispatched_at,created_at)<?) ORDER BY created_at LIMIT 1", Date.now() - 120000, Date.now() - 30 * 60000);
  for (const batch of expired) {
   const running = batch.status === 'running';
   await env.DB.batch([
-   env.DB.prepare("UPDATE runs SET status='failed',ended_at=?,attempts=CASE WHEN ? THEN reserved_attempts ELSE 0 END,error=?,key_cipher='' WHERE batch_id=? AND status IN ('queued','running')").bind(Date.now(), running ? 1 : 0, running ? '执行器中断，已保留此前回传的报告。' : '排队超过 30 分钟，请检查 GitHub 额度和执行器配置。', batch.id),
+   env.DB.prepare("UPDATE runs SET status=CASE WHEN stop_requested_at IS NOT NULL THEN 'cancelled' ELSE 'failed' END,ended_at=?,attempts=CASE WHEN ? THEN reserved_attempts ELSE 0 END,error=CASE WHEN stop_requested_at IS NOT NULL THEN '停止请求已保存，但执行器中断，无法确认最后的请求数；按预留上限计入预算。' ELSE ? END,key_cipher='' WHERE batch_id=? AND status IN ('queued','running')").bind(Date.now(), running ? 1 : 0, running ? '执行器中断，已保留此前回传的报告。' : '排队超过 30 分钟，请检查 GitHub 额度和执行器配置。', batch.id),
    env.DB.prepare("UPDATE batches SET status='failed',ended_at=?,error=? WHERE id=?").bind(Date.now(), '执行器未完成任务', batch.id),
    env.DB.prepare('UPDATE quota_reservations SET amount=? WHERE id=?').bind(running ? 15 : 0, batch.id + ':minutes'),
   ]);
@@ -190,6 +249,7 @@ export async function expireBatches(env: Env) {
   }
  }
  await finalizeRunSets(env);
+ return expired.length;
 }
 
 function notificationState(run: Row) {
@@ -210,20 +270,23 @@ export async function finalizeRunSets(env: Env, setId?: string) {
   env.DB.prepare('INSERT OR IGNORE INTO run_set_members(set_id,run_id) SELECT b.id,r.id FROM batches b JOIN runs r ON r.batch_id=b.id JOIN run_sets s ON s.id=b.id'),
   env.DB.prepare("UPDATE notices SET status='cancelled' WHERE kind='run' AND status='pending' AND reference IN (SELECT run_id FROM run_set_members)"),
  ]);
- const waiting = await rows(env, "SELECT * FROM run_sets WHERE ended_at IS NULL" + (setId ? ' AND id=?' : '') + ' ORDER BY created_at', ...(setId ? [setId] : []));
+ const waiting = await rows(env, "SELECT * FROM run_sets WHERE ended_at IS NULL AND NOT EXISTS(SELECT 1 FROM run_set_members m JOIN runs r ON r.id=m.run_id WHERE m.set_id=run_sets.id AND r.status IN ('queued','running'))" + (setId ? ' AND id=?' : '') + ' ORDER BY created_at LIMIT 3', ...(setId ? [setId] : []));
  if (!waiting.length) return;
  const mail = await setting<Row>(env, 'mail');
  for (const group of waiting) {
   const reports = await rows(env, 'SELECT r.* FROM runs r JOIN run_set_members m ON r.id=m.run_id WHERE m.set_id=?', group.id);
   if (!reports.length || reports.some(r => ['queued', 'running'].includes(r.status))) continue;
   const manual = group.source !== 'scheduled';
-  let send = !group.superseded_by && mail.enabled && (manual ? manualMailEnabled(mail) : mail.mode !== 'daily');
+  let send = !group.superseded_by && mail.enabled && reports.some(r => r.status !== 'cancelled') && (manual ? manualMailEnabled(mail) : mail.mode !== 'daily');
   if (send && !manual && mail.mode === 'changes') {
    send = false;
-   for (const run of reports) {
-    const previous = await row(env, `SELECT r.report,r.status FROM runs r JOIN run_set_members m ON m.run_id=r.id JOIN run_sets s ON s.id=m.set_id
-     WHERE r.target_id=? AND s.source='scheduled' AND s.id!=? AND s.created_at<=? AND s.ended_at IS NOT NULL
-      AND s.superseded_by IS NULL AND r.status NOT IN ('queued','running') ORDER BY s.created_at DESC LIMIT 1`, run.target_id, group.id, group.created_at);
+   const previousRuns = await rows(env, `SELECT r.target_id,r.report,r.status FROM runs r WHERE r.id IN (
+    SELECT (SELECT r2.id FROM runs r2 JOIN run_set_members m ON m.run_id=r2.id JOIN run_sets s ON s.id=m.set_id
+     WHERE r2.target_id=current.target_id AND s.source='scheduled' AND s.id!=? AND s.created_at<=? AND s.ended_at IS NOT NULL
+      AND s.superseded_by IS NULL AND r2.status NOT IN ('queued','running','cancelled') ORDER BY s.created_at DESC LIMIT 1)
+    FROM runs current JOIN run_set_members member ON member.run_id=current.id WHERE member.set_id=?)`, group.id, group.created_at, group.id);
+   for (const run of reports.filter(r => r.status !== 'cancelled')) {
+    const previous = previousRuns.find(previous => previous.target_id === run.target_id);
     const state = notificationState(run);
     if (state !== (previous ? notificationState(previous) : null) && (previous || state !== 'match')) { send = true; break; }
    }
@@ -237,7 +300,7 @@ export async function finalizeRunSets(env: Env, setId?: string) {
  }
 }
 export async function pendingNotices(env: Env) {
- const records = await rows(env, "SELECT * FROM notices WHERE status='pending' ORDER BY created_at LIMIT 30");
+ const records = await rows(env, "SELECT * FROM notices WHERE status='pending' ORDER BY created_at LIMIT 3");
  const result: Row[] = [];
  for (const notice of records) {
   let reports: Row[] = []; let source: string | undefined;

@@ -29,10 +29,12 @@ export function detectionOverview(data: Pick<PanelData, 'runs' | 'run_sets'>, no
   resolved += ended ? weight : run.status === 'running' ? completed : 0; planned += weight;
  }
  const queued = selected.filter(run => run.status === 'queued').length;
- const running = selected.filter(run => run.status === 'running').length;
- const finished = selected.length - queued - running;
+ const running = selected.filter(run => run.status === 'running' && !run.stop_requested_at).length;
+ const stopping = selected.filter(run => run.status === 'running' && !!run.stop_requested_at).length;
+ const stopped = selected.filter(run => run.status === 'cancelled').length;
+ const finished = selected.length - queued - running - stopping;
  const failed = selected.filter(run => run.status === 'failed' || run.status === 'timed_out').length;
- return { runs: selected, sets: selectedSets, total: selected.length, queued, running, finished, failed, active: queued + running, percent: Math.min(active.length ? 99 : 100, Math.floor(resolved / planned * 100)) };
+ return { runs: selected, sets: selectedSets, total: selected.length, queued, running, stopping, stopped, finished, failed, active: queued + running + stopping, percent: Math.min(active.length ? 99 : 100, Math.floor(resolved / planned * 100)) };
 }
 function positive(value: unknown) { return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0; }
 
@@ -40,7 +42,8 @@ export function detectionMailState(data: Pick<PanelData, 'mail'>, overview: NonN
  if (!data.mail.enabled) return { label: '邮件通知已关闭', state: 'off', detail: '检测结果仍会保存到报告。' };
  const sets = overview.sets.filter(set => set.source === 'scheduled' ? data.mail.mode !== 'daily' : data.mail.notify_manual);
  if (!sets.length) return { label: '本批次不即时发送邮件', state: 'off', detail: overview.sets.some(set => set.source === 'scheduled') && data.mail.mode === 'daily' ? '自动检测按每天汇总策略发送。' : '手动检测邮件通知已关闭。' };
- if (overview.active) return { label: '等待整批结束后汇总', state: 'waiting', detail: '全部目标结束后发送汇总邮件，失败或超时也会纳入报告。' };
+ if (overview.active) return { label: '等待整批结束后汇总', state: 'waiting', detail: '全部目标结束后发送汇总邮件，失败、超时及已暂停目标也会纳入报告。' };
+ if (overview.stopped === overview.total) return { label: '本批次全部已暂停', state: 'off', detail: '样本与请求数已保留，本批次不发送即时汇总邮件。' };
  const notices = sets.map(set => set.notice);
  if (notices.some(notice => notice?.status === 'failed')) return { label: '邮件发送失败', state: 'failed', detail: notices.find(notice => notice?.status === 'failed')?.error || '检测报告已保存，请检查邮件设置。' };
  if (notices.some(notice => notice?.status === 'processing')) return { label: '正在发送汇总邮件', state: 'sending', detail: '报告已保存，邮件正在连接邮箱服务器并提交。' };

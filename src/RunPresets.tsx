@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Check, ChevronDown, ChevronRight, Pencil, Play, Plus, Star, Trash2 } from 'lucide-react';
 import ConnectionContext from './ConnectionContext.tsx';
-import { BASELINES, plannedRequests, PROTOCOL_LABEL, TIER_LABEL, type PanelData, type RunPreset, type Target } from './shared.ts';
+import { BASELINES, DETECTION_BATCH_SIZE, plannedRequests, PROTOCOL_LABEL, TIER_LABEL, type PanelData, type RunPreset, type Target } from './shared.ts';
 
 function supported(target: Target) { return BASELINES[target.protocol].models.includes(target.claimed_model); }
 function requestCount(targets: Target[]) { return targets.filter(supported).reduce((sum, target) => sum + plannedRequests(target.protocol, target.tier).logical, 0); }
@@ -44,7 +44,7 @@ export function RunPresetForm({ data, value, initialTargetIds = [], busy, save }
     <div><div className="preset-target-head"><strong>{target.name}</strong><span>{PROTOCOL_LABEL[target.protocol]} · {TIER_LABEL[target.tier]}档</span></div><ConnectionContext compact station={endpoint?.station_name || '—'} keyName={endpoint?.name || '—'} group={data.groups.find(group => group.id === endpoint?.group_id)?.name || '默认分组'} />{!supported(target) && <small className="preset-warning">暂无对应基准，可保存；发起检测时会跳过。</small>}</div>
    </label>;
   })}</div>
-  <div className="preset-summary"><Check size={17} /><div><strong>已选 {chosen.length} 个模型 · 预计 {requestCount(chosen)} 次首轮请求</strong><p>检测时沿用各模型最新的 Key 和默认档位，重试另计。{eligible.length < chosen.length && `其中 ${chosen.length - eligible.length} 个模型暂无对应基准。`}</p></div></div>
+  <div className="preset-summary"><Check size={17} /><div><strong>已选 {chosen.length} 个模型 · 预计 {requestCount(chosen)} 次首轮请求</strong><p>检测时沿用各模型最新的 Key 和默认档位；每批最多 {DETECTION_BATCH_SIZE} 个并发，其余自动排队，重试另计。{eligible.length < chosen.length && `其中 ${chosen.length - eligible.length} 个模型暂无对应基准。`}</p></div></div>
   <p className="form-help">保存组合不会发起检测。{data.mail.enabled && data.mail.notify_manual ? '点击检测组合后，全部结束时发送一封汇总邮件。' : '检测结果保存在面板，发送邮件取决于你的手动检测通知设置。'}</p>
   <div className="form-actions"><button className="button primary" disabled={busy || !chosen.length}>{busy ? '保存中…' : '保存常用组合'}</button></div>
  </form>;

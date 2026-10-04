@@ -106,3 +106,20 @@ npm run configure:login -- --email 你的邮箱 --upload
 修改后旧会话立即失效。登录会话默认保持 30 天，支持浏览器密码管理器；生产 Cookie 使用 HttpOnly、Secure、SameSite。
 
 更新源码后，先检查变更并将执行器文件推送到私有默认分支，再执行部署及远程检查。运行 `npm run setup:local` 会按版本清单核验内核和六套基准；只有维护者更新锁定清单才会改变新任务使用的内核或基准，历史报告保留当时的快照。
+
+## 从 1.0.0 升级到 1.1.0
+
+1. 等待进行中的检测与邮件任务结束，并备份自己的数据库、`.local/` 中的密钥与登录校验文件。
+2. 更新到本项目 `v1.1.0`，保留自己的 `wrangler.jsonc` 账户、D1 和仓库配置。将新版源码、runner 与迁移文件推送到私有执行仓库默认分支。
+3. 重新部署并验证：
+
+   ```bash
+   npm ci
+   npm run setup:local
+   npm run deploy -- --free-tier-checked
+   npm run deploy:check -- --remote
+   ```
+
+新版包含 `0006_stop_runs.sql` 与 `0007_execution_queue.sql`，增加停止请求标记、执行队列字段及索引。部署脚本自动应用 D1 迁移；本地启动时自动应用 SQLite 迁移，不需要重建数据库。原模型配置、API Key、历史报告和定时计划继续保留。
+
+暂停检测需要新版 Worker 与新版 Python runner 配合。先同步私有仓库默认分支，再部署网站；仅更新浏览器界面不足以启用暂停和自动队列。

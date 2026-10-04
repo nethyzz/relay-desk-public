@@ -65,6 +65,7 @@ export function classifyError(value: unknown): ReportIssue {
 export function reportIssues(report: Report | null | undefined, status?: RunStatus, fallback?: string | null): ReportIssue[] {
   const issues: ReportIssue[] = [];
   const add = (error: unknown) => {
+    if (object(error).code === 'user_paused') return;
     const issue = classifyError(error);
     const existing = issues.find(v => v.code === issue.code && v.httpStatus === issue.httpStatus && v.title === issue.title && v.detail === issue.detail);
     if (existing) existing.count++; else issues.push(issue);
@@ -105,6 +106,7 @@ export function fingerprintReason(value: string): string {
     multiple_matches: '多个候选模型达到判定线，无法唯一指向',
     unknown_claimed_model: '申报模型尚未收录在基准中',
     insufficient_samples: '有效样本不足',
+    user_paused: '用户暂停了本次检测，已保留部分样本',
   };
   return reasons[value] || classifyError({ code: value }).title + `（${value}）`;
 }

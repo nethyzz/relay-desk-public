@@ -20,6 +20,8 @@ import urllib.request
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+STOP_POLL_SECONDS = 3
+MAX_BATCH_REQUESTS = 64
 sys.path.insert(0, str(ROOT)) if str(ROOT) not in sys.path else None
 from runner.network import public_address, proxy_dns_addresses
 from runner.mail import notice_message
@@ -180,10 +182,17 @@ def baseline_path(config: dict) -> Path:
         raise ExecutionError('benchmark_error')
     return path
 
-async def execute_job(client: Client, batch_id: str, job: dict, deadline: float):
+def batch_request_workers(job_count: int) -> int:
+    # Network waits dominate detection. Keep the frozen engine's eight workers
+    # for small batches, then divide one runner's request budget across targets.
+    return max(1, min(8, MAX_BATCH_REQUESTS // max(1, job_count)))
+
+async def execute_job(client: Client, batch_id: str, job: dict, deadline: float, stop_event: asyncio.Event | None = None, *, request_workers: int = 8, rate_gates: dict | None = None):
     session = None
     store = None
     progress_task = None
+    stop_task = None
+    running = None
     report = None
     status = 'failed'
     attempts = 0
@@ -194,40 +203,61 @@ async def execute_job(client: Client, batch_id: str, job: dict, deadline: float)
     with tempfile.TemporaryDirectory(prefix='relay-detector-') as directory:
         try:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if stop_event is not None and stop_event.is_set():
+                status = 'cancelled'
+            elif remaining <= 0:
                 status = 'timed_out'
             else:
                 sys.path.insert(0, str(ROOT / '.vendor')) if str(ROOT / '.vendor') not in sys.path else None
                 await asyncio.to_thread(public_host, job['config']['base_url'], local=bool(getattr(client, 'local_headers', None)))
+                if stop_event is not None and stop_event.is_set():
+                    status = 'cancelled'
+                    return
                 stage = 'detector_setup'
                 from gpt56_vnext.detector import DetectorSession
+                from gpt56_vnext.executor import AsyncTransport
                 from gpt56_vnext.store import SQLiteStateStore
                 from gpt56_vnext.benchmark import load_package
                 config = job['config']
                 package = load_package(baseline_path(config).read_bytes())
                 store = SQLiteStateStore(Path(directory) / 'state.sqlite3')
-                options = {'base_url': config['base_url'], 'allow_insecure': False, 'request_model': config['request_model'], 'claimed_model': config['claimed_model'], 'tier': config['tier'], 'site_group': config['group_name'], 'benchmark_publisher': 'maintainer', 'runtime': {'workers': 8, 'timeout': 120, 'retry_budget': config['retry_budget'], 'retain_raw': False}}
-                session = DetectorSession(store, job['id'], package, options, key)
+                options = {'base_url': config['base_url'], 'allow_insecure': False, 'request_model': config['request_model'], 'claimed_model': config['claimed_model'], 'tier': config['tier'], 'site_group': config['group_name'], 'benchmark_publisher': 'maintainer', 'runtime': {'workers': request_workers, 'timeout': 120, 'retry_budget': config['retry_budget'], 'retain_raw': False}}
+                transport = AsyncTransport([key], timeout=120, concurrency=request_workers, gates=rate_gates)
+                session = DetectorSession(store, job['id'], package, options, key, transport=transport)
                 stage = 'detection'
                 async def progress():
                     while True:
                         await asyncio.sleep(10)
                         with contextlib.suppress(Exception):
-                            await client.post(prefix + 'progress', {'run_id': job['id'], 'report': session.report()})
+                            control = await client.post(prefix + 'progress', {'run_id': job['id'], 'report': session.report()})
+                            if control.get('stop_requested') and stop_event is not None:
+                                stop_event.set()
                 progress_task = asyncio.create_task(progress())
                 running = asyncio.create_task(session.run())
+                stop_task = asyncio.create_task(stop_event.wait()) if stop_event is not None else None
                 try:
-                    report = await asyncio.wait_for(asyncio.shield(running), max(1, deadline - time.monotonic()))
-                    failed_samples = report.get('results', [])
-                    all_failed = failed_samples and all(row.get('status') == 'error' for row in failed_samples)
-                    status = 'failed' if report.get('failure') or all_failed else 'completed'
-                except asyncio.TimeoutError:
-                    session.stop()
-                    running.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await running
-                    report = session.report()
-                    status = 'timed_out'
+                    watched = {running, stop_task} if stop_task is not None else {running}
+                    done, _ = await asyncio.wait(watched, timeout=max(0, deadline - time.monotonic()), return_when=asyncio.FIRST_COMPLETED)
+                    stopped = stop_event is not None and stop_event.is_set()
+                    if stopped or running not in done:
+                        # Use the upstream stop mechanism to cancel transports,
+                        # settle dispatched attempts and retain completed samples.
+                        session.stop()
+                        running.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await running
+                        report = session.report()
+                        status = 'cancelled' if stopped else 'timed_out'
+                    else:
+                        report = await running
+                        failed_samples = report.get('results', [])
+                        all_failed = failed_samples and all(row.get('status') == 'error' for row in failed_samples)
+                        status = 'failed' if report.get('failure') or all_failed else 'completed'
+                finally:
+                    if stop_task is not None:
+                        stop_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await stop_task
                 attempts = attempts_in(report, job['maximum_attempts'])
         except Exception as error:
             if session is not None:
@@ -242,6 +272,12 @@ async def execute_job(client: Client, batch_id: str, job: dict, deadline: float)
             # Do not print exceptions from API clients: providers may echo credentials.
             print('一个检测目标未完成；结果与可用证据将回传面板。', flush=True)
         finally:
+            # Never close the store while upstream request workers still use it.
+            if running is not None and not running.done():
+                session.stop()
+                running.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await running
             if progress_task is not None:
                 progress_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -327,18 +363,33 @@ async def run_batch(client: Client, batch_id: str, oidc: str | None, workflow_st
         return
     client.lease = claim['lease']
     mask_secret(client.lease)
+    stop_events = {job['id']: asyncio.Event() for job in claim.get('jobs', [])}
+    for job in claim.get('jobs', []):
+        if job.get('stop_requested'):
+            stop_events[job['id']].set()
+    async def controls():
+        response = await client.post(f'runner/batches/{batch_id}/heartbeat', {})
+        for run_id in response.get('stop_run_ids', []):
+            if run_id in stop_events:
+                stop_events[run_id].set()
     async def heartbeat():
         while True:
-            await asyncio.sleep(25)
+            await asyncio.sleep(STOP_POLL_SECONDS if claim['kind'] == 'detection' else 25)
             with contextlib.suppress(Exception):
-                await client.post(f'runner/batches/{batch_id}/heartbeat', {})
+                await controls()
     heartbeat_task = asyncio.create_task(heartbeat())
     try:
         if claim['kind'] == 'detection':
+            # Check once before opening any provider connections; a stop may
+            # have arrived immediately after claim returned its credentials.
+            await controls()
             deadline = time.monotonic() + min(600, claim.get('timeout_seconds', 600))
-            # Up to five independent detector sessions share one runner. Each
-            # keeps its own store, eight request workers and original scoring.
-            jobs = [execute_job(client, batch_id, job, deadline) for job in claim['jobs']]
+            # Bounded batches share one runner and the original upstream rate
+            # gates. A 429/Retry-After slows the same station's other models too.
+            # Sampling, retry budgets and scoring stay in the frozen engine.
+            workers = batch_request_workers(len(claim['jobs']))
+            rate_gates = {}
+            jobs = [execute_job(client, batch_id, job, deadline, stop_events[job['id']], request_workers=workers, rate_gates=rate_gates) for job in claim['jobs']]
             # A failed result submission must not cancel another target's
             # detection or discard its evidence. Wait for every submission,
             # then report only a fixed error without provider response text.

@@ -21,6 +21,7 @@ def claimed_score(report: dict) -> float | None:
     return None
 
 def result_label(report: dict) -> str:
+    if report['status'] == 'cancelled': return '已暂停，仅保留部分样本'
     if report['status'] == 'failed': return '请求失败或检测未完成'
     if report['status'] == 'timed_out': return '检测超时，已保存部分证据'
     if report['status'] != 'completed': return '检测未完成'
@@ -30,7 +31,7 @@ def result_label(report: dict) -> str:
 def availability_order(report: dict) -> tuple:
     evidence = fingerprint(report)
     available = report['status'] == 'completed' and evidence.get('valid_samples', 0) > 0
-    rank = 0 if available else 1 if report['status'] == 'completed' else 2 if report['status'] == 'timed_out' else 3
+    rank = 0 if available else 1 if report['status'] == 'completed' else 2 if report['status'] == 'timed_out' else 4 if report['status'] == 'cancelled' else 3
     score = claimed_score(report)
     return (rank, -(score if score is not None else -1), report['snapshot'].get('target_name', ''), report['id'])
 
@@ -90,10 +91,11 @@ def notice_message(origin: str, settings: dict, notice: dict) -> EmailMessage:
                 tier = TIERS.get(snapshot.get('tier'), '未记录')
                 when = report_time(report)
                 lines.extend([f'{clean(name)} / {clean(group_name)}：{state} · 申报匹配度 {percent}', f'请求模型：{clean(model)}；申报模型：{clean(claimed)}；{tier}档', f'有效样本：{valid} / {planned}；实际请求：{report.get("attempts", "未记录")}；{threshold_text}；北京时间 {when}', link, ''])
-                color = '#47745b' if state == LABELS['match'] else '#ad6452' if report['status'] != 'completed' or state == LABELS['mismatch'] else '#8b7951'
+                color = '#7b8875' if report['status'] == 'cancelled' else '#47745b' if state == LABELS['match'] else '#ad6452' if report['status'] != 'completed' or state == LABELS['mismatch'] else '#8b7951'
+                sample_note = '<br><span style="color:#7b8875">暂停前部分样本</span>' if report['status'] == 'cancelled' else ''
                 html.append('<tr style="border-bottom:1px solid #e5e9de">' +
                     f'<td><strong>{safe(name)}</strong><br>{safe(group_name)} · {safe(tier)}档<br><span style="color:#7b8875">请求：{safe(model)}<br>申报：{safe(claimed)}</span></td>' +
-                    f'<td><strong style="font-size:17px;white-space:nowrap">{safe(percent)}</strong><br><span style="color:#7b8875">{safe(threshold_text)}</span></td>' +
+                    f'<td><strong style="font-size:17px;white-space:nowrap">{safe(percent)}</strong>{sample_note}<br><span style="color:#7b8875">{safe(threshold_text)}</span></td>' +
                     f'<td><strong style="color:{color}">{safe(state)}</strong></td>' +
                     f'<td>{safe(valid)} / {safe(planned)} 有效<br>{safe(report.get("attempts", "未记录"))} 次请求<br><span style="color:#7b8875">{safe(when)} 北京时间</span></td>' +
                     f'<td><a href="{safe(link)}" style="color:#47745b">查看</a></td></tr>')

@@ -29,6 +29,124 @@ function fixture() {
  return { db, env, call, endpoint, target, runnerHeaders, leaseHeaders, pending };
 }
 function report(verdict = 'match', claimed = BASELINES.gpt.models[0]) { return { fingerprint: { verdict, claimed_model: claimed, model: verdict === 'match' ? claimed : null, matches: { [claimed]: .86 }, thresholds: { [claimed]: .65 }, valid_samples: 32, planned_samples: 32, reasons: [] }, progress: { actual_attempts: 32 }, benchmark: { id: BASELINES.gpt.id, version: BASELINES.gpt.version, content_sha256: BASELINES.gpt.sha256 } }; }
+test('queued stops cancel exact runs once, release unused budget, and never return cancelled credentials', async () => {
+ const f = fixture(); const endpoint = await f.endpoint(); const a = await f.target(endpoint); const b = await f.target(endpoint, 'gpt', '第二个模型');
+ const created = (await f.call('runs', 'POST', { targetIds: [a, b], tier: 'low' })).data;
+ const [first, second] = created.runIds;
+ const stopped = await f.call('runs/stop', 'POST', { runIds: [first, first] });
+ assert.equal(stopped.status, 200); assert.equal(stopped.data.stopped, 1);
+ const saved = (await f.call('runs/' + first)).data.runs.find((run: Run) => run.id === first);
+ assert.equal(saved.status, 'cancelled'); assert.equal(saved.attempts, 0); assert.ok(saved.stop_requested_at);
+ assert.equal((await row(f.env, 'SELECT key_cipher FROM runs WHERE id=?', first))!.key_cipher, '');
+ assert.equal((await f.call('panel')).data.usage.daily_requests, 48);
+ assert.equal((await f.call('runs/stop', 'POST', { runIds: [first] })).data.runs[0].stop_requested_at, saved.stop_requested_at);
+ const claimed = await f.call(`runner/batches/${created.runId}/claim`, 'POST', {}, f.runnerHeaders);
+ assert.equal(claimed.status, 200); assert.deepEqual(claimed.data.jobs.map((job: any) => job.id), [second]);
+ assert.equal(claimed.data.jobs[0].api_key, secret); f.db.close();
+});
+test('stopping an entire never-started batch ends it and dispatch/claim cannot re-open it', async () => {
+ const f = fixture(); const target = await f.target(await f.endpoint());
+ const created = (await f.call('runs', 'POST', { targetIds: [target], tier: 'low' })).data;
+ assert.equal((await f.call('runs/stop', 'POST', { runIds: created.runIds })).status, 200);
+ const panel = (await f.call('panel')).data;
+ assert.equal(panel.usage.daily_requests, 0); assert.equal(panel.usage.monthly_minutes, 0);
+ assert.equal((await row(f.env, 'SELECT status FROM batches WHERE id=?', created.runId))!.status, 'completed');
+ assert.equal((await f.call(`runner/batches/${created.runId}/claim`, 'POST', {}, f.runnerHeaders)).data.done, true);
+ const next = (await f.call('runs', 'POST', { targetIds: [target], tier: 'low' })).data;
+ assert.equal(next.reused, false); assert.notEqual(next.runIds[0], created.runIds[0]);
+ await f.call('runs/stop', 'POST', { runIds: created.runIds });
+ assert.equal((await row(f.env, 'SELECT status FROM runs WHERE id=?', next.runIds[0]))!.status, 'queued', 'a stale stop button cannot stop a new detection'); f.db.close();
+});
+test('running stops wait for runner ACK, preserve evidence and do not stop the other target or monitoring schedule', async () => {
+ const f = fixture(); const endpoint = await f.endpoint(); const a = await f.target(endpoint); const b = await f.target(endpoint, 'gpt', '继续运行');
+ await f.call('schedules/' + a, 'PUT', { enabled: true, interval_minutes: 360 });
+ const beforeSchedule = await row(f.env, 'SELECT * FROM schedules WHERE target_id=?', a);
+ const created = (await f.call('runs', 'POST', { targetIds: [a, b], tier: 'low' })).data;
+ const first = (await row(f.env, 'SELECT id FROM runs WHERE batch_id=? AND target_id=?', created.runId, a))!.id;
+ const second = (await row(f.env, 'SELECT id FROM runs WHERE batch_id=? AND target_id=?', created.runId, b))!.id;
+ const claimed = (await f.call(`runner/batches/${created.runId}/claim`, 'POST', {}, f.runnerHeaders)).data;
+ const prefix = `runner/batches/${created.runId}/`; const headers = f.leaseHeaders(claimed.lease);
+ const partial = { ...report(), progress: { http_attempts: 12 }, fingerprint: { ...report().fingerprint, valid_samples: 10 }, detail: secret };
+ await f.call(prefix + 'progress', 'POST', { run_id: first, report: partial }, headers);
+ const stopped = await f.call('runs/stop', 'POST', { runIds: [first] }); assert.equal(stopped.status, 202); assert.equal(stopped.data.stopping, 1);
+ const stopping = await row(f.env, 'SELECT * FROM runs WHERE id=?', first);
+ assert.equal(stopping!.status, 'running'); assert.ok(stopping!.key_cipher);
+ assert.equal((await f.call('panel')).data.usage.daily_requests, 96, 'in-flight requests keep their reservation until confirmation');
+ assert.deepEqual((await f.call(prefix + 'heartbeat', 'POST', {}, headers)).data.stop_run_ids, [first]);
+ assert.equal((await f.call(prefix + 'progress', 'POST', { run_id: first, report: partial }, headers)).data.stop_requested, true);
+ const repeated = (await f.call('runs', 'POST', { targetIds: [a], tier: 'low' })).data;
+ assert.equal(repeated.reused, true); assert.deepEqual(repeated.runIds, [first], 'cannot start a second job before stop acknowledgement');
+ assert.equal((await f.call(prefix + 'complete', 'POST', { minutes: 1 }, headers)).status, 409);
+ assert.equal((await f.call(prefix + 'results/' + first, 'POST', { status: 'cancelled', attempts: 12, report: partial }, headers)).status, 200);
+ const saved = (await f.call('runs/' + first)).data.runs.find((run: Run) => run.id === first);
+ assert.equal(saved.status, 'cancelled'); assert.equal(saved.report.operational_status, 'paused'); assert.equal(saved.report.fingerprint.valid_samples, 10); assert.equal(saved.attempts, 12);
+ assert.ok(!JSON.stringify(saved).includes(secret)); assert.equal(saved.error, null);
+ assert.equal((await row(f.env, 'SELECT key_cipher FROM runs WHERE id=?', first))!.key_cipher, '');
+ assert.equal((await row(f.env, 'SELECT status FROM runs WHERE id=?', second))!.status, 'running');
+ assert.equal((await f.call('panel')).data.usage.daily_requests, 60);
+ await f.call(prefix + 'results/' + first, 'POST', { status: 'completed', attempts: 32, report: report() }, headers);
+ assert.equal((await row(f.env, 'SELECT attempts FROM runs WHERE id=?', first))!.attempts, 12, 'late responses cannot overwrite paused evidence');
+ await f.call(prefix + 'results/' + second, 'POST', { status: 'completed', attempts: 32, report: report() }, headers);
+ assert.equal((await f.call(prefix + 'complete', 'POST', { minutes: 2 }, headers)).status, 200);
+ assert.equal((await f.call('panel')).data.usage.daily_requests, 44); assert.equal((await f.call('panel')).data.usage.monthly_minutes, 2);
+ assert.deepEqual(await row(f.env, 'SELECT * FROM schedules WHERE target_id=?', a), beforeSchedule); f.db.close();
+});
+test('a stop racing final submission wins inside the result write and still retains the returned samples', async () => {
+ const f = fixture(); const target = await f.target(await f.endpoint()); const created = (await f.call('runs', 'POST', { targetIds: [target], tier: 'low' })).data;
+ const claim = (await f.call(`runner/batches/${created.runId}/claim`, 'POST', {}, f.runnerHeaders)).data;
+ await f.call('runs/stop', 'POST', { runIds: created.runIds });
+ await f.call(`runner/batches/${created.runId}/results/${created.runIds[0]}`, 'POST', { status: 'completed', attempts: 21, report: report() }, f.leaseHeaders(claim.lease));
+ const run = (await f.call('runs/' + created.runIds[0])).data.runs[0];
+ assert.equal(run.status, 'cancelled'); assert.equal(run.attempts, 21); assert.equal(run.report.fingerprint.valid_samples, 32); f.db.close();
+});
+test('batch stop is atomic on unknown IDs, rejects cross-origin or anonymous calls and validates its shape', async () => {
+ const f = fixture(); const target = await f.target(await f.endpoint()); const created = (await f.call('runs', 'POST', { targetIds: [target], tier: 'low' })).data;
+ assert.equal((await f.call('runs/stop', 'POST', { runIds: [created.runIds[0], 'missing'] })).status, 404);
+ for (const payload of [{ runIds: [] }, { runIds: [1] }, { runIds: ['x'.repeat(65)] }, { runIds: created.runIds, targetIds: [target] }]) assert.equal((await f.call('runs/stop', 'POST', payload)).status, 400);
+ assert.equal((await f.call('runs/stop', 'POST', { runIds: created.runIds }, { Origin: 'https://other.example.com' })).status, 403);
+ f.env.DEV_MODE = undefined;
+ assert.equal((await f.call('runs/stop', 'POST', { runIds: created.runIds })).status, 401);
+ assert.equal((await row(f.env, 'SELECT status,stop_requested_at FROM runs WHERE id=?', created.runIds[0]))!.status, 'queued'); f.db.close();
+});
+test('cancelled-only selections send no immediate mail, while mixed batches include one paused entry', async () => {
+ const f = fixture(); const ep = await f.endpoint(); const a = await f.target(ep); const b = await f.target(ep, 'gpt', '未暂停');
+ await f.call('settings/mail', 'PUT', { enabled: true, notify_manual: true, mode: 'all', host: 'smtp.example.com', port: 465, username: 'from@example.com', from: 'from@example.com', to: 'to@example.com', password: 'fixture-mail-secret' });
+ const first = (await f.call('runs', 'POST', { targetIds: [a], tier: 'low' })).data;
+ await f.call('runs/stop', 'POST', { runIds: first.runIds }); assert.equal((await pendingNotices(f.env)).length, 0);
+ const mixed = (await f.call('runs', 'POST', { targetIds: [a, b], tier: 'low' })).data;
+ await f.call('runs/stop', 'POST', { runIds: [mixed.runIds[0]] });
+ const claim = (await f.call(`runner/batches/${mixed.runId}/claim`, 'POST', {}, f.runnerHeaders)).data;
+ await f.call(`runner/batches/${mixed.runId}/results/${mixed.runIds[1]}`, 'POST', { status: 'completed', attempts: 32, report: report() }, f.leaseHeaders(claim.lease));
+ const notices = await pendingNotices(f.env); assert.equal(notices.length, 1);
+ assert.deepEqual(new Set(notices[0].reports.map((run: Run) => run.status)), new Set(['completed', 'cancelled'])); f.db.close();
+});
+test('an expired runner with a pending stop preserves evidence and keeps unknown request costs conservative', async () => {
+ const f = fixture(); const target = await f.target(await f.endpoint()); const created = (await f.call('runs', 'POST', { targetIds: [target], tier: 'low' })).data;
+ const claim = (await f.call(`runner/batches/${created.runId}/claim`, 'POST', {}, f.runnerHeaders)).data;
+ await f.call(`runner/batches/${created.runId}/progress`, 'POST', { run_id: created.runIds[0], report: report() }, f.leaseHeaders(claim.lease));
+ await f.call('runs/stop', 'POST', { runIds: created.runIds });
+ await f.env.DB.prepare('UPDATE batches SET lease_until=? WHERE id=?').bind(Date.now() - 180000, created.runId).run();
+ await tick(f.env);
+ const run = (await f.call('runs/' + created.runIds[0])).data.runs[0];
+ assert.equal(run.status, 'cancelled'); assert.equal(run.report.fingerprint.valid_samples, 32); assert.equal(run.attempts, 48); assert.match(run.error, /无法确认/);
+ assert.equal((await f.call('panel')).data.usage.daily_requests, 48); f.db.close();
+});
+test('a paused monitoring round cannot create a false recovery or anomaly notification', async () => {
+ const f = fixture(); const target = await f.target(await f.endpoint());
+ await f.call('settings/mail', 'PUT', { enabled: true, notify_manual: false, mode: 'changes', host: 'smtp.example.com', port: 465, username: 'from@example.com', from: 'from@example.com', to: 'to@example.com', password: 'fixture-mail-secret' });
+ const finish = async (verdict: string) => {
+  const created = await createRuns(f.env, [target], 'low', 'scheduled');
+  const claim = (await f.call(`runner/batches/${created.runId}/claim`, 'POST', {}, f.runnerHeaders)).data;
+  await f.call(`runner/batches/${created.runId}/results/${created.runIds[0]}`, 'POST', { status: 'completed', attempts: 32, report: report(verdict) }, f.leaseHeaders(claim.lease));
+  await f.call(`runner/batches/${created.runId}/complete`, 'POST', { minutes: 1 }, f.leaseHeaders(claim.lease));
+ };
+ await finish('match');
+ const paused = await createRuns(f.env, [target], 'low', 'scheduled');
+ await f.call('runs/stop', 'POST', { runIds: paused.runIds });
+ await finish('match');
+ assert.equal((await pendingNotices(f.env)).length, 0);
+ await finish('mismatch'); assert.equal((await pendingNotices(f.env)).length, 1); f.db.close();
+});
 test('credentials are encrypted at rest and never returned to the browser', async () => {
  const f = fixture(); const ep = await f.endpoint(); const stored = await row(f.env, 'SELECT * FROM endpoints WHERE id=?', ep);
  assert.ok(!stored!.key_cipher.includes(secret)); assert.equal(await decrypt(stored!.key_cipher, f.env, 'endpoint:' + ep), secret);
@@ -251,7 +369,7 @@ test('schedules default off, missed cycles coalesce, and pause prevents future c
 });
 test('run expiry releases unstarted reservations and charges uncertain running attempts conservatively', async () => {
  const f = fixture(); const target = await f.target(await f.endpoint()); const result = await f.call('runs', 'POST', { targetIds: [target], tier: 'low' });
- await f.env.DB.prepare('UPDATE batches SET created_at=? WHERE id=?').bind(Date.now() - 31 * 60000, result.data.runId).run(); await tick(f.env);
+ await f.env.DB.prepare("UPDATE batches SET status='dispatched',dispatched_at=?,dispatch_started_at=? WHERE id=?").bind(Date.now() - 31 * 60000, Date.now() - 31 * 60000, result.data.runId).run(); await tick(f.env);
  assert.equal((await f.call('panel')).data.usage.daily_requests, 0); assert.equal((await f.call('runs/' + result.data.runId)).data.runs[0].status, 'failed'); f.db.close();
 });
 test('mail defaults off; failures do not erase reports, and duplicate state does not spam', async () => {
@@ -464,11 +582,13 @@ test('overlapping selections reuse runs from multiple runners, combine unsent su
  await f.call('settings/mail', 'PUT', testMail);
  const first = await createRuns(f.env, [a], 'low'); const second = await createRuns(f.env, [b], 'low');
  const group = await createRuns(f.env, [a, b], 'low'); assert.equal(group.reused, true); assert.equal((await rows(f.env, 'SELECT * FROM runs')).length, 2);
- const claims = await Promise.all([first, second].map(task => f.call(`runner/batches/${task.runId}/claim`, 'POST', {}, f.runnerHeaders)));
+ const claims: Awaited<ReturnType<typeof f.call>>[] = [];
  for (const [index, task] of [first, second].entries()) {
+  claims.push(await f.call(`runner/batches/${task.runId}/claim`, 'POST', {}, f.runnerHeaders));
   const headers = f.leaseHeaders(claims[index].data.lease); const prefix = `runner/batches/${task.runId}/`;
   await f.call(prefix + 'results/' + task.runIds[0], 'POST', { status: index === 0 ? 'completed' : 'failed', attempts: 32, report: report('insufficient') }, headers);
   assert.equal((await f.call(prefix + 'notices', 'POST', {}, headers)).data.notices.length, index === 0 ? 0 : 1);
+  await f.call(prefix + 'complete', 'POST', { minutes: 1 }, headers);
  }
  const notices = await pendingNotices(f.env); assert.equal(notices.length, 1); assert.equal(notices[0].reports.length, 2);
  const begin = await Promise.all([first, second].map((task, index) => f.call(`runner/batches/${task.runId}/notice-begin`, 'POST', { notice_id: notices[0].id }, f.leaseHeaders(claims[index].data.lease))));
@@ -611,7 +731,7 @@ test('common selections persist across groups and relays, and editing or deletin
 test('invalid common selections cannot replace a valid selection or silently create a missing edit', async () => {
  const f = fixture(); const target = await f.target(await f.endpoint()); const preset = (await f.call('run-presets', 'POST', { name: '保留组合', targetIds: [target] })).data.id;
  const before = (await f.call('panel')).data.run_presets;
- for (const change of [{ targetIds: [] }, { targetIds: [target, 'missing'] }, { targetIds: [123] }, { targetIds: [' '] }, { targetIds: Array(6).fill(target) }, { name: '' }, { name: 'n'.repeat(65) }, { name: 'bad\nname' }, { key: secret }]) {
+ for (const change of [{ targetIds: [] }, { targetIds: [target, 'missing'] }, { targetIds: [123] }, { targetIds: [' '] }, { name: '' }, { name: 'n'.repeat(65) }, { name: 'bad\nname' }, { key: secret }]) {
   const result = await f.call('run-presets', 'POST', { id: preset, name: '不能覆盖', targetIds: [target], ...change });
   assert.ok([400, 404].includes(result.status)); assert.deepEqual((await f.call('panel')).data.run_presets, before);
  }

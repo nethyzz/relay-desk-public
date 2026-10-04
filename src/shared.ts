@@ -1,18 +1,19 @@
 export type Tier = 'low' | 'medium' | 'high';
 export type Protocol = 'gpt' | 'claude' | 'gpt-chat' | 'claude-chat';
 export type Verdict = 'match' | 'mismatch' | 'insufficient';
-export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'timed_out';
+export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'timed_out' | 'cancelled';
 export interface Group { id: string; name: string; created_at: number }
 export interface Endpoint { id: string; group_id: string; name: string; station_name: string; base_url: string; credential_saved: boolean; created_at: number; updated_at: number }
 export interface Target { id: string; endpoint_id: string; name: string; protocol: Protocol; request_model: string; claimed_model: string; tier: Tier; created_at: number }
 export interface Schedule { target_id: string; enabled: boolean; kind: 'interval' | 'daily'; interval_minutes: number; daily_time: string; tier: Tier; next_due: number | null; last_error: string | null }
 export interface Fingerprint { verdict: Verdict; model: string | null; claimed_model: string; matches: Record<string, number>; thresholds: Record<string, number>; valid_samples: number; planned_samples: number; reasons: string[]; partial_samples?: boolean }
 export interface Report { fingerprint?: Fingerprint; benchmark?: { id: string; version: string; content_sha256: string }; progress?: Record<string, unknown>; operational_status?: string; failure?: string | null; endpoint?: string; request_model?: string; claimed_model?: string; tier?: Tier; results?: unknown[]; [key: string]: unknown }
-export interface Run { id: string; batch_id: string; target_id: string; status: RunStatus; source: string; created_at: number; started_at: number | null; ended_at: number | null; attempts: number; reserved_attempts: number; progress: Record<string, unknown> | null; report: Report | null; snapshot: RunSnapshot; error: string | null }
+export interface Run { id: string; batch_id: string; target_id: string; status: RunStatus; source: string; created_at: number; started_at: number | null; ended_at: number | null; stop_requested_at?: number | null; attempts: number; reserved_attempts: number; progress: Record<string, unknown> | null; report: Report | null; snapshot: RunSnapshot; error: string | null }
 export interface RunSnapshot { target_name: string; endpoint_name: string; station_name?: string; base_url: string; group_name: string; protocol: Protocol; request_model: string; claimed_model: string; tier: Tier; baseline_id: string; baseline_version: string; baseline_sha256: string; logical_requests: number; retry_budget: number; endpoint_id: string }
 export interface MailSettings { enabled: boolean; notify_manual: boolean; mode: 'changes' | 'daily' | 'all'; host: string; port: number; username: string; from: string; to: string; credential_saved: boolean }
 export interface Limits { daily_requests: number; monthly_minutes: number }
 export interface MailTest { id: string; status: string; created_at: number; sent_at: number | null; error: string | null }
+export const DETECTION_BATCH_SIZE = 20;
 export interface RunSet { id: string; source: string; created_at: number; ended_at: number | null; run_ids: string[]; notice: MailTest | null }
 export interface RunPreset { id: string; name: string; target_ids: string[]; created_at: number; updated_at: number }
 export interface PanelData { groups: Group[]; endpoints: Endpoint[]; targets: Target[]; schedules: Schedule[]; runs: Run[]; run_sets?: RunSet[]; run_presets?: RunPreset[]; limits: Limits; mail: MailSettings; usage: { daily_requests: number; monthly_minutes: number }; execution_ready: boolean; local: boolean; preview_only?: boolean; last_mail_error: string | null; last_mail_test: MailTest | null }

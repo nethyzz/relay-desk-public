@@ -14,13 +14,16 @@ Relay Desk 提供界面、配置管理、任务调度、预算控制与通知；
 
 [快速开始](#快速开始) · [使用指南](docs/USAGE.md) · [云端部署](docs/DEPLOYMENT.md) · [原作者与第三方声明](THIRD_PARTY_NOTICES.md) · [更新记录](CHANGELOG.md)
 
+当前发布：[v1.1.0](https://github.com/nethyzz/relay-desk-public/releases/tag/v1.1.0)。新增按范围暂停与自动分批队列，取消固定的目标数量上限；已有部署的升级步骤见 [部署指南](docs/DEPLOYMENT.md#从-100-升级到-110)。
+
 ## 程序介绍
 
 | 功能 | 说明 |
 | --- | --- |
 | 多站点与多 Key | 同一中转站可保存多条独立 Key，各自管理分组和模型 |
 | 四种 API 协议 | GPT Responses、GPT Chat 兼容、Claude Messages、Claude Chat 兼容 |
-| 单次与批量检测 | 按分组、中转站或勾选目标检测，每批最多 5 个目标并发执行 |
+| 单次与批量检测 | 可提交整个筛选范围或任意组合，自动拆分为每批最多 20 个目标，按队列依次执行 |
+| 暂停检测 | 支持单个目标、当前范围或勾选目标暂停，执行器确认后保留已完成样本 |
 | 常用检测组合 | 保存跨分组、跨中转站的模型组合，多设备登录后复用 |
 | 批量编辑 | 预览后统一修改协议、申报模型、请求别名和手动默认档位 |
 | 定时监测 | 支持间隔或每日计划，保留每次检测使用的配置与基准快照 |
@@ -35,7 +38,8 @@ Relay Desk 提供界面、配置管理、任务调度、预算控制与通知；
 flowchart LR
     Browser[电脑或手机浏览器] --> Panel[Relay Desk 面板]
     Panel --> Database[SQLite 本地 / D1 云端]
-    Panel --> Runner[本机 Python / 私有 GitHub Actions]
+    Panel --> Queue[自动分批队列 · 每批最多 20 个目标]
+    Queue --> Runner[本机 Python / 私有 GitHub Actions]
     Runner --> Engine[原版 meow LLM Detector 4.5.4]
     Engine --> Provider[用户配置的模型 API]
     Runner --> Reports[报告回传与可选 SMTP 通知]
@@ -70,6 +74,8 @@ npm run setup:local -- --proxy http://127.0.0.1:你的代理端口
 2. 添加模型，选择协议与「希望验证的模型」，填写服务商实际接受的请求模型名；也可获取模型列表后选择。
 3. 选择快速、标准或深度档位，再发起检测。GPT 当前基准推荐深度档 128 次；快速档适合先检查配置和连接。
 4. 在总览查看进度，打开报告查看结论、判定线和有效样本。真实请求费用由自己的模型 API 账户承担。
+
+可以一次提交超过 20 个模型；后台会分批执行，并在整个选择完成后汇总通知。应用不再设固定的目标数量上限，实际规模仍受平台存储与请求容量约束。暂停本次任务后，已有证据保留；再次检测会从头开始，后续定时监测计划不受影响。
 
 本地数据保存在 `.local/panel.sqlite`；解密主密钥保存在 `.local/secrets.json`。**备份和迁移时一起保留这两个文件**，不要把它们提交到 GitHub。
 

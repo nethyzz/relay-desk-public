@@ -19,6 +19,61 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
 class RunnerTests(unittest.TestCase):
+    def test_batch_controls_deliver_stop_to_one_job_and_mail_waits_for_both_final_reports(self):
+        class Collector:
+            origin = 'https://panel.example.com'
+            lease = ''
+            def __init__(self): self.saved, self.polls, self.entered = [], 0, asyncio.Event()
+            def request(self, path, payload, oidc):
+                return {'kind': 'detection', 'lease': 'fixture-lease', 'jobs': [{'id': 'stop'}, {'id': 'keep'}]}
+            async def post(self, path, payload):
+                if path.endswith('/heartbeat'):
+                    self.polls += 1
+                    return {'stop_run_ids': ['stop'] if self.polls > 1 else []}
+                if path.endswith('/notices'):
+                    if len(self.saved) != 2: raise AssertionError('mail before all result submissions')
+                    return {'mail': None, 'notices': []}
+                return {'ok': True}
+        async def scenario():
+            client = Collector()
+            gate_maps = []
+            async def execute(client, batch, job, deadline, stop_event, **kwargs):
+                gate_maps.append(kwargs['rate_gates'])
+                self.assertEqual(kwargs['request_workers'], 8)
+                if job['id'] == 'stop':
+                    await stop_event.wait()
+                    client.entered.set()
+                else:
+                    await client.entered.wait()
+                    self.assertFalse(stop_event.is_set())
+                client.saved.append(job['id'])
+            with patch.object(runner, 'execute_job', side_effect=execute), patch.object(runner, 'mask_secret'), patch.object(runner, 'STOP_POLL_SECONDS', .01):
+                await asyncio.wait_for(runner.run_batch(client, 'batch', None, time.time()), 2)
+            self.assertCountEqual(client.saved, ['stop', 'keep'])
+            self.assertGreaterEqual(client.polls, 2)
+            self.assertIs(gate_maps[0], gate_maps[1])
+        asyncio.run(scenario())
+
+    def test_request_worker_budget_keeps_small_batches_fast_and_large_batches_bounded(self):
+        for count in range(1, 21):
+            workers = runner.batch_request_workers(count)
+            self.assertLessEqual(workers * count, runner.MAX_BATCH_REQUESTS)
+            self.assertGreaterEqual(workers, 1)
+            self.assertLessEqual(workers, 8)
+        self.assertEqual(runner.batch_request_workers(5), 8)
+        self.assertEqual(runner.batch_request_workers(20), 3)
+
+    def test_paused_mail_bolds_status_and_marks_percent_as_partial_evidence(self):
+        report = {'id': 'paused', 'status': 'cancelled', 'attempts': 12,
+                  'snapshot': {'claimed_model': 'gpt-6.1-sol', 'request_model': 'fixture-model', 'logical_requests': 32},
+                  'report': {'fingerprint': {'verdict': 'match', 'valid_samples': 10, 'matches': {'gpt-6.1-sol': .99}}}}
+        message = runner.notice_message('https://panel.example.com', {'from': 'from@example.com', 'to': 'to@example.com'}, {'id': 'notice', 'kind': 'batch', 'reports': [report]})
+        html = message.get_body(preferencelist=('html',)).get_content()
+        self.assertRegex(html, r'<strong[^>]*>已暂停，仅保留部分样本</strong>')
+        self.assertIn('暂停前部分样本', html)
+        self.assertIn('99.0%', html)
+        self.assertIn('0 个支持申报模型', html)
+
     def test_cloud_startup_errors_explain_stage_without_echoing_credentials(self):
         secret = 'private-token-never-print'
         failure = urllib.error.HTTPError('https://panel.example.com/?token=' + secret, 401, secret, {}, None)
@@ -93,30 +148,64 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('A &amp; B', html)
         self.assertEqual(html.count('<table '), 1)
 
-    def test_five_shared_host_jobs_start_together_and_mail_waits_for_every_job(self):
+    def test_twenty_shared_host_jobs_start_together_and_mail_waits_for_every_job(self):
         class Collector:
             origin = 'https://panel.example.com'
             lease = ''
             def __init__(self): self.saved, self.events = [], []
             def request(self, path, payload, oidc):
-                return {'kind': 'detection', 'lease': 'fixture-lease', 'jobs': [{'id': str(i), 'config': {'base_url': 'https://same.example.com'}} for i in range(5)]}
+                return {'kind': 'detection', 'lease': 'fixture-lease', 'jobs': [{'id': str(i), 'config': {'base_url': 'https://same.example.com'}} for i in range(20)]}
             async def post(self, path, payload):
                 self.events.append(path)
                 if path.endswith('/notices'):
-                    if len(self.saved) != 5: raise AssertionError('mail requested before completion')
+                    if len(self.saved) != 20: raise AssertionError('mail requested before completion')
                     return {'mail': None, 'notices': []}
                 return {'ok': True}
         async def scenario():
             client, entered, gate = Collector(), set(), asyncio.Event()
-            async def execute(client, batch, job, deadline):
+            async def execute(client, batch, job, deadline, stop_event=None, **kwargs):
                 entered.add(job['id'])
-                if len(entered) == 5: gate.set()
+                self.assertEqual(kwargs['request_workers'], 3)
+                if len(entered) == 20: gate.set()
                 await gate.wait()
                 client.saved.append(job['id'])
             with patch.object(runner, 'execute_job', side_effect=execute), patch.object(runner, 'mask_secret'):
                 await asyncio.wait_for(runner.run_batch(client, 'batch', None, time.time()), 2)
-            self.assertEqual(len(client.saved), 5)
+            self.assertEqual(len(client.saved), 20)
             self.assertTrue(client.events[-1].endswith('/complete'))
+        asyncio.run(scenario())
+
+    @unittest.skipUnless((ROOT / '.vendor/gpt56_vnext/transport.py').is_file(), 'Install the pinned original detector first')
+    def test_shared_original_transport_waits_after_429_before_another_model_dispatches(self):
+        import httpx
+        from gpt56_vnext.transport import AsyncTransport
+        from gpt56_vnext.errors import RequestError
+        async def scenario():
+            base, shared, dispatches = 'https://same.example.com/v1', {}, []
+            async def reply(request):
+                dispatches.append(request)
+                if len(dispatches) == 1:
+                    return httpx.Response(429, headers={'Retry-After': '0.03'}, json={'error': {'message': 'busy'}})
+                stream = 'data: ' + json.dumps({'choices': [{'index': 0, 'delta': {'content': 'A'}, 'finish_reason': 'stop'}]}) + '\n\ndata: [DONE]\n\n'
+                return httpx.Response(200, headers={'Content-Type': 'text/event-stream'}, text=stream)
+            first = AsyncTransport(['fixture-first-key'], concurrency=3, gates=shared)
+            second = AsyncTransport(['fixture-second-key'], concurrency=3, gates=shared)
+            first._clients[base] = httpx.AsyncClient(transport=httpx.MockTransport(reply))
+            second._clients[base] = httpx.AsyncClient(transport=httpx.MockTransport(reply))
+            try:
+                with self.assertRaises(RequestError) as error:
+                    await first.request('chat', base, 'fixture-first-key', 'first-model', {'prompt': 'A'})
+                self.assertEqual(error.exception.status, 429)
+                pending = asyncio.create_task(second.request('chat', base, 'fixture-second-key', 'second-model', {'prompt': 'A'}))
+                await asyncio.sleep(.04)
+                self.assertEqual(len(dispatches), 1, 'another model must respect the same station cooldown')
+                self.assertFalse(pending.done())
+                result = await asyncio.wait_for(pending, 3)
+                self.assertEqual(result['answer'], 'A')
+                self.assertEqual(len(dispatches), 2)
+            finally:
+                await first.close()
+                await second.close()
         asyncio.run(scenario())
 
     def test_failed_result_submission_waits_for_other_targets_and_hides_error_secrets(self):
@@ -136,7 +225,7 @@ class RunnerTests(unittest.TestCase):
                 return {'ok': True}
         async def scenario():
             client, entered, gate = Collector(), set(), asyncio.Event()
-            async def execute(client, batch, job, deadline):
+            async def execute(client, batch, job, deadline, stop_event=None, **kwargs):
                 entered.add(job['id'])
                 if len(entered) == 3: gate.set()
                 await gate.wait()

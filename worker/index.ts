@@ -2,11 +2,15 @@ import { ApiError, type Env, type Context } from './types.ts';
 import { decrypt, encrypt, ensurePublicHostname, integerValue, localRequest, publicUrl, sameOrigin, session, sign, textValue, verifyOidc } from './security.ts';
 import { clearLoginAttempts, loginCredentials, reserveLoginAttempt, verifyLoginProof } from './password.ts';
 import { mailRecipients, manualMailEnabled, nextDue, protocolValue, safeReport, shanghaiDay, tierValue } from './domain.ts';
-import { claim, createRuns, decodeRun, dispatch, executionReady, expireBatches, finishBatch, finishRun, finalizeRunSets, id, noticeAllowed, noticeInBatch, panel, pendingNotices, requireLease, row, rows, saveSetting, setting, usage } from './data.ts';
+import { claim, createRuns, decodeRun, dispatch, dispatchQueued, executionReady, expireBatches, finishBatch, finishRun, finalizeRunSets, id, noticeAllowed, noticeInBatch, panel, pendingNotices, requireLease, row, rows, saveSetting, setting, stopRuns, usage } from './data.ts';
 import { BASELINES, baselineFor, defaultRequestModel, type Limits, type MailSettings, type Protocol } from '../src/shared.ts';
 type Json = Record<string, any>;
 function json(value: unknown, status = 200, headers: Record<string, string> = {}) { return Response.json(value, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...headers } }); }
 async function body(request: Request, limit = 65536): Promise<Json> { const raw = await request.text(); if (raw.length > limit) throw new ApiError('提交内容过大', 413); try { const value = JSON.parse(raw); if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error(); return value; } catch { throw new ApiError('提交内容不是有效的 JSON'); } }
+function selectedIds(value: unknown, label: string): string[] {
+ if (!Array.isArray(value) || !value.length || value.some(id => typeof id !== 'string')) throw new ApiError(`请至少选择一个${label}`);
+ return [...new Set(value.map(id => textValue(id, label + ' ID', 64)))];
+}
 export async function handleRequest(request: Request, env: Env, ctx: Context): Promise<Response> {
  const url = new URL(request.url); const path = url.pathname;
  try {
@@ -22,23 +26,21 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    return json({ ok: true }, 200, { 'Set-Cookie': `__Host-relay_session=${signed}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000` });
   }
   if (path === '/api/auth/callback') throw new ApiError('已改为账号密码登录，请返回面板登录页', 410);
-  if (path.startsWith('/api/runner/')) return await runnerRoute(request, env, path);
+  if (path.startsWith('/api/runner/')) return await runnerRoute(request, env, path, ctx);
   if (!path.startsWith('/api/')) return env.ASSETS ? env.ASSETS.fetch(request) : new Response('Relay Desk API', { status: 200 });
   if (!await session(request, env)) throw new ApiError('请先登录', 401);
   if (!['GET', 'HEAD'].includes(request.method)) sameOrigin(request, env);
   if (path === '/api/auth/logout' && request.method === 'POST') return json({ ok: true }, 200, { 'Set-Cookie': '__Host-relay_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0' });
   if (path === '/api/panel' && request.method === 'GET') return json(await panel(env));
   if (path === '/api/run-presets' && request.method === 'POST') {
-   const b = await body(request);
+   const b = await body(request, 1200000);
    if (Object.keys(b).some(field => !['id', 'name', 'targetIds'].includes(field))) throw new ApiError('常用组合包含不支持的设置');
    const presetId = b.id === undefined ? id() : textValue(b.id, '组合 ID', 64);
    const name = textValue(b.name, '组合名称', 64);
    if (b.id !== undefined && !await row(env, 'SELECT id FROM run_presets WHERE id=?', presetId)) throw new ApiError('常用组合不存在，请刷新后重试', 404);
-   if (!Array.isArray(b.targetIds) || b.targetIds.length > 5 || b.targetIds.some(value => typeof value !== 'string')) throw new ApiError('请选择一至五个模型加入常用组合');
-   const targetIds = [...new Set(b.targetIds.map(value => textValue(value, '模型 ID', 64)))];
-   if (!targetIds.length) throw new ApiError('请至少选择一个模型');
-   const selected = await rows(env, `SELECT DISTINCT e.id,e.key_cipher FROM targets t JOIN endpoints e ON e.id=t.endpoint_id WHERE t.id IN (${targetIds.map(() => '?').join(',')})`, ...targetIds);
-   const existing = await rows(env, `SELECT id FROM targets WHERE id IN (${targetIds.map(() => '?').join(',')})`, ...targetIds);
+   const targetIds = selectedIds(b.targetIds, '模型'); const selection = JSON.stringify(targetIds);
+   const selected = await rows(env, 'SELECT DISTINCT e.id,e.key_cipher FROM targets t JOIN endpoints e ON e.id=t.endpoint_id WHERE t.id IN (SELECT value FROM json_each(?))', selection);
+   const existing = await rows(env, 'SELECT id FROM targets WHERE id IN (SELECT value FROM json_each(?))', selection);
    if (existing.length !== targetIds.length) throw new ApiError('组合中的模型已不存在，请刷新后重新选择', 404);
    for (const endpoint of selected) if (name.includes(await decrypt(endpoint.key_cipher, env, 'endpoint:' + endpoint.id))) throw new ApiError('组合名称不能包含 API Key');
    if (b.id === undefined && (await row(env, 'SELECT COUNT(*) AS n FROM run_presets'))!.n >= 20) throw new ApiError('最多保存二十个常用组合，请编辑已有组合');
@@ -46,7 +48,7 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    await env.DB.batch([
     env.DB.prepare('INSERT INTO run_presets(id,name,created_at,updated_at) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at').bind(presetId, name, now, now),
     env.DB.prepare('DELETE FROM run_preset_targets WHERE preset_id=?').bind(presetId),
-    ...targetIds.map((targetId, position) => env.DB.prepare('INSERT INTO run_preset_targets(preset_id,target_id,position) VALUES (?,?,?)').bind(presetId, targetId, position)),
+    env.DB.prepare('INSERT INTO run_preset_targets(preset_id,target_id,position) SELECT ?,value,CAST(key AS INTEGER) FROM json_each(?)').bind(presetId, selection),
    ]);
    return json({ id: presetId });
   }
@@ -97,11 +99,9 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    return json({ ok: true, profiles_updated: profiles.length, base_url: base });
   }
   if (path === '/api/targets/batch' && request.method === 'POST') {
-   const b = await body(request);
+   const b = await body(request, 1200000);
    if (Object.keys(b).some(field => !['targetIds', 'changes', 'sync_request_model'].includes(field))) throw new ApiError('批量编辑包含不支持的字段');
-   if (!Array.isArray(b.targetIds) || b.targetIds.some(value => typeof value !== 'string')) throw new ApiError('请选择一至五个检测目标');
-   const targetIds = [...new Set(b.targetIds.map(value => textValue(value, '目标 ID', 64)))];
-   if (!targetIds.length || targetIds.length > 5) throw new ApiError('请选择一至五个检测目标');
+   const targetIds = selectedIds(b.targetIds, '检测目标');
    const changes = b.changes;
    if (!changes || typeof changes !== 'object' || Array.isArray(changes) || Object.keys(changes).some(field => !['protocol', 'claimed_model', 'request_model', 'tier'].includes(field))) throw new ApiError('批量编辑的模型设置不正确');
    if (b.sync_request_model !== undefined && typeof b.sync_request_model !== 'boolean') throw new ApiError('同步请求模型开关不正确');
@@ -114,24 +114,28 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    const tierChange = Object.hasOwn(changes, 'tier') ? tierValue(changes.tier) : undefined;
    const claimedChange = Object.hasOwn(changes, 'claimed_model') ? textValue(changes.claimed_model, '申报模型') : undefined;
    const requestChange = Object.hasOwn(changes, 'request_model') ? textValue(changes.request_model, '实际请求模型') : undefined;
-   const updates = [];
-   for (const targetId of targetIds) {
-    const target = await row(env, 'SELECT * FROM targets WHERE id=?', targetId);
-    if (!target) throw new ApiError('所选检测目标不存在，请刷新后重新选择', 404);
-    const endpoint = await row(env, 'SELECT * FROM endpoints WHERE id=?', target.endpoint_id);
-    if (!endpoint) throw new ApiError('检测目标对应的站点不存在', 404);
+   const updates = []; const secrets = new Map<string, string>();
+   const targets = await rows(env, 'SELECT t.*,e.base_url,e.key_cipher FROM targets t JOIN endpoints e ON e.id=t.endpoint_id WHERE t.id IN (SELECT value FROM json_each(?))', JSON.stringify(targetIds));
+   if (targets.length !== targetIds.length) throw new ApiError('所选检测目标或对应站点不存在，请刷新后重新选择', 404);
+   for (const target of targets) {
     if (!protocolChange && (typeof target.protocol !== 'string' || !Object.hasOwn(BASELINES, target.protocol))) throw new ApiError('所选目标的请求协议不正确，请选择新的协议');
     const protocol = protocolChange ?? protocolValue(target.protocol);
     const claimed = claimedChange ?? textValue(target.claimed_model, '申报模型');
-    const model = textValue(sync ? defaultRequestModel(protocol, claimed, endpoint.base_url) : requestChange ?? target.request_model, '实际请求模型');
+    const model = textValue(sync ? defaultRequestModel(protocol, claimed, target.base_url) : requestChange ?? target.request_model, '实际请求模型');
     const tier = tierChange ?? tierValue(target.tier);
     const name = textValue(target.name, '目标名称');
-    const secret = await decrypt(endpoint.key_cipher, env, 'endpoint:' + endpoint.id);
+    if (!secrets.has(target.endpoint_id)) secrets.set(target.endpoint_id, await decrypt(target.key_cipher, env, 'endpoint:' + target.endpoint_id));
+    const secret = secrets.get(target.endpoint_id)!;
     if ([name, model, claimed].some(value => value.includes(secret))) throw new ApiError('模型配置中不能包含 API Key');
-    if (protocol !== target.protocol || claimed !== target.claimed_model || model !== target.request_model || tier !== target.tier) updates.push(env.DB.prepare('UPDATE targets SET protocol=?,request_model=?,claimed_model=?,tier=? WHERE id=?').bind(protocol, model, claimed, tier, targetId));
+    if (protocol !== target.protocol || claimed !== target.claimed_model || model !== target.request_model || tier !== target.tier) updates.push({ id: target.id, protocol, request_model: model, claimed_model: claimed, tier });
    }
    if (!updates.length) throw new ApiError('所选目标已经使用这些设置，无需更新');
-   await env.DB.batch(updates);
+   await env.DB.prepare(`WITH changes AS (SELECT value FROM json_each(?)) UPDATE targets SET
+    protocol=(SELECT json_extract(value,'$.protocol') FROM changes WHERE json_extract(value,'$.id')=targets.id),
+    request_model=(SELECT json_extract(value,'$.request_model') FROM changes WHERE json_extract(value,'$.id')=targets.id),
+    claimed_model=(SELECT json_extract(value,'$.claimed_model') FROM changes WHERE json_extract(value,'$.id')=targets.id),
+    tier=(SELECT json_extract(value,'$.tier') FROM changes WHERE json_extract(value,'$.id')=targets.id)
+    WHERE id IN (SELECT json_extract(value,'$.id') FROM changes)`).bind(JSON.stringify(updates)).run();
    return json({ ok: true, updated: updates.length });
   }
   if (path === '/api/targets' && request.method === 'POST') {
@@ -141,7 +145,6 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    if ([name, model, claimed].some(v => v.includes(secret))) throw new ApiError('模型配置中不能包含 API Key');
    const groupId = b.group_id === undefined ? endpoint.group_id : textValue(b.group_id, '分组');
    if (!await row(env, 'SELECT id FROM groups WHERE id=?', groupId)) throw new ApiError('分组不存在');
-   if (!b.id && (await row(env, 'SELECT COUNT(*) AS n FROM targets'))!.n >= 5) throw new ApiError('此个人版本最多保存五个检测目标');
    await env.DB.batch([
     env.DB.prepare('INSERT INTO targets(id,endpoint_id,name,protocol,request_model,claimed_model,tier,created_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET endpoint_id=excluded.endpoint_id,name=excluded.name,protocol=excluded.protocol,request_model=excluded.request_model,claimed_model=excluded.claimed_model,tier=excluded.tier').bind(targetId, endpoint.id, name, protocol, model, claimed, tier, Date.now()),
     env.DB.prepare('INSERT OR IGNORE INTO schedules(target_id,updated_at) VALUES (?,?)').bind(targetId, Date.now()),
@@ -158,10 +161,14 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    const models = (Array.isArray(result.data) ? result.data : []).map((v: Json) => v.id).filter((v: unknown): v is string => typeof v === 'string' && v.length <= 256 && !v.includes(key)); return json({ models });
   }
   if (path === '/api/runs' && request.method === 'POST') {
-   const b = await body(request); if (!Array.isArray(b.targetIds)) throw new ApiError('请选择一至五个检测目标');
-   const targetIds = [...new Set(b.targetIds)] as unknown[];
-   if (!targetIds.length || targetIds.length > 5 || targetIds.some(v => typeof v !== 'string')) throw new ApiError('请选择一至五个检测目标');
-   const result = await createRuns(env, targetIds as string[], b.tier ? tierValue(b.tier) : undefined); if (!result.reused) ctx.waitUntil(dispatch(env, result.runId)); return json(result, 202);
+   const b = await body(request, 1200000); const targetIds = selectedIds(b.targetIds, '检测目标');
+   const result = await createRuns(env, targetIds, b.tier ? tierValue(b.tier) : undefined); ctx.waitUntil(dispatchQueued(env)); return json(result, 202);
+  }
+  if (path === '/api/runs/stop' && request.method === 'POST') {
+   const b = await body(request, 1200000);
+   if (Object.keys(b).some(field => field !== 'runIds')) throw new ApiError('停止请求包含不支持的设置');
+   const runIds = selectedIds(b.runIds, '正在进行的检测');
+   const result = await stopRuns(env, runIds); ctx.waitUntil(dispatchQueued(env)); return json(result, result.stopping ? 202 : 200);
   }
   if (/^\/api\/runs\/[^/]+$/.test(path) && request.method === 'GET') {
    const runId = path.split('/')[3]; const single = await row(env, 'SELECT * FROM runs WHERE id=?', runId); const batch = await row(env, 'SELECT id,kind,status,created_at,started_at,ended_at,error,last_dispatch_error FROM batches WHERE id=?', single?.batch_id || runId);
@@ -214,7 +221,7 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
   throw new ApiError('接口不存在', 404);
  } catch (error) { return json({ error: error instanceof ApiError ? error.message : '操作暂时失败，请稍后重试。' }, error instanceof ApiError ? error.status : 500); }
 }
-async function runnerRoute(request: Request, env: Env, path: string) {
+async function runnerRoute(request: Request, env: Env, path: string, ctx: Context) {
  if (path === '/api/runner/queue' && request.method === 'GET') { if (!localRequest(request, env)) throw new ApiError('接口不存在', 404); await verifyOidc(request, env); return json({ batches: await rows(env, "SELECT id FROM batches WHERE status='queued' ORDER BY created_at LIMIT 1") }); }
  const match = path.match(/^\/api\/runner\/batches\/([^/]+)\/(claim|heartbeat|progress|complete|notices|notice-begin|notice-result|results\/[^/]+)$/);
  if (!match || request.method !== 'POST') throw new ApiError('执行器接口不存在', 404);
@@ -222,15 +229,21 @@ async function runnerRoute(request: Request, env: Env, path: string) {
  if (action === 'claim') return json(await claim(request, env, batchId));
  await requireLease(request, env, batchId);
  const b = await body(request, action.startsWith('results/') || action === 'progress' ? 1200000 : 65536);
- if (action === 'heartbeat') { await env.DB.prepare("UPDATE batches SET heartbeat_at=? WHERE id=? AND status='running'").bind(Date.now(), batchId).run(); return json({ ok: true }); }
+ if (action === 'heartbeat') {
+  await env.DB.prepare("UPDATE batches SET heartbeat_at=? WHERE id=? AND status='running'").bind(Date.now(), batchId).run();
+  const stopped = await rows(env, "SELECT id FROM runs WHERE batch_id=? AND status='running' AND stop_requested_at IS NOT NULL", batchId);
+  return json({ ok: true, stop_run_ids: stopped.map(run => run.id) });
+ }
  if (action === 'progress') {
   const run = await row(env, "SELECT * FROM runs WHERE id=? AND batch_id=? AND status='running'", b.run_id, batchId); if (!run) return json({ ok: true });
   const key = await decrypt(run.key_cipher, env, 'run:' + run.id); const report = b.report ? safeReport(b.report, [key]) : null;
   const progress = report?.progress || {};
-  await env.DB.prepare("UPDATE runs SET progress=?,report=COALESCE(?,report) WHERE id=? AND status='running'").bind(JSON.stringify(progress), report ? JSON.stringify(report) : null, run.id).run(); return json({ ok: true });
+  await env.DB.prepare("UPDATE runs SET progress=?,report=COALESCE(?,report) WHERE id=? AND status='running'").bind(JSON.stringify(progress), report ? JSON.stringify(report) : null, run.id).run();
+  const control = await row(env, 'SELECT stop_requested_at FROM runs WHERE id=?', run.id);
+  return json({ ok: true, stop_requested: control?.stop_requested_at != null });
  }
  if (action.startsWith('results/')) return json(await finishRun(env, batchId, action.split('/')[1], b));
- if (action === 'complete') { const minutes = integerValue(b.minutes, '执行分钟', 1, 15); return json(await finishBatch(env, batchId, minutes)); }
+ if (action === 'complete') { const minutes = integerValue(b.minutes, '执行分钟', 1, 15); const result = await finishBatch(env, batchId, minutes); ctx.waitUntil(dispatchQueued(env)); return json(result); }
  if (action === 'notices') {
   const mail = await setting<Json>(env, 'mail'); if (!mail.enabled) return json({ mail: null, notices: [] });
   await finalizeRunSets(env);
@@ -259,22 +272,26 @@ async function runnerRoute(request: Request, env: Env, path: string) {
 export async function tick(env: Env) {
  await expireBatches(env);
  if (!executionReady(env)) return;
- const now = Date.now(); const due = await rows(env, 'SELECT s.*,t.protocol,t.claimed_model,t.name AS target_name FROM schedules s JOIN targets t ON t.id=s.target_id WHERE s.enabled=1 AND s.next_due<=? ORDER BY s.next_due LIMIT 5', now);
- const supported = [];
+ const now = Date.now(); const due = await rows(env, 'SELECT s.*,t.protocol,t.claimed_model,t.name AS target_name FROM schedules s JOIN targets t ON t.id=s.target_id WHERE s.enabled=1 AND s.next_due<=? ORDER BY s.next_due', now);
+ const supported = []; const advances: { target_id: string; next_due: number; last_error: string | null }[] = [];
+ const advance = (s: Json, last_error: string | null) => ({ target_id: s.target_id as string, next_due: nextDue({ kind: s.kind, interval_minutes: s.interval_minutes, daily_time: s.daily_time }, now), last_error });
  for (const s of due) {
   if (baselineFor(s.protocol as Protocol, s.claimed_model)?.models.includes(s.claimed_model)) supported.push(s);
-  else await env.DB.prepare('UPDATE schedules SET next_due=?,last_error=? WHERE target_id=? AND enabled=1').bind(nextDue({ kind: s.kind, interval_minutes: s.interval_minutes, daily_time: s.daily_time }, now), `${s.target_name} 暂无对应基准，暂不支持自动检测。`, s.target_id).run();
+  else advances.push(advance(s, `${s.target_name} 暂无对应基准，暂不支持自动检测。`));
  }
- // One scheduler round shares one runner and one summary, retaining individual tiers.
+ // A scheduler round shares one summary across bounded, queued runner batches.
  if (supported.length) {
-  try { const created = await createRuns(env, supported.map(s => s.target_id), undefined, 'scheduled', Object.fromEntries(supported.map(s => [s.target_id, tierValue(s.tier)]))); if (!created.reused) await dispatch(env, created.runId);
-   for (const s of supported) await env.DB.prepare('UPDATE schedules SET next_due=?,last_error=NULL WHERE target_id=? AND enabled=1').bind(nextDue({ kind: s.kind, interval_minutes: s.interval_minutes, daily_time: s.daily_time }, now), s.target_id).run();
+  try { await createRuns(env, supported.map(s => s.target_id), undefined, 'scheduled', Object.fromEntries(supported.map(s => [s.target_id, tierValue(s.tier)])));
+   advances.push(...supported.map(s => advance(s, null)));
   } catch (error) {
-   for (const s of supported) await env.DB.prepare('UPDATE schedules SET next_due=?,last_error=? WHERE target_id=? AND enabled=1').bind(nextDue({ kind: s.kind, interval_minutes: s.interval_minutes, daily_time: s.daily_time }, now), error instanceof ApiError ? error.message : '监测执行失败，下一周期重试。', s.target_id).run();
+   advances.push(...supported.map(s => advance(s, error instanceof ApiError ? error.message : '监测执行失败，下一周期重试。')));
   }
  }
- const queued = await rows(env, "SELECT id FROM batches WHERE status='queued' AND (dispatched_at IS NULL OR dispatched_at<?) ORDER BY created_at LIMIT 5", now - 5 * 60000);
- for (const b of queued) await dispatch(env, b.id);
+ if (advances.length) await env.DB.prepare(`WITH advances AS (SELECT value FROM json_each(?)) UPDATE schedules SET
+  next_due=(SELECT json_extract(value,'$.next_due') FROM advances WHERE json_extract(value,'$.target_id')=schedules.target_id),
+  last_error=(SELECT json_extract(value,'$.last_error') FROM advances WHERE json_extract(value,'$.target_id')=schedules.target_id)
+  WHERE enabled=1 AND target_id IN (SELECT json_extract(value,'$.target_id') FROM advances)`).bind(JSON.stringify(advances)).run();
+ await dispatchQueued(env);
  const mail = await setting<Json>(env, 'mail'); if (!mail.enabled) return;
  if (mail.mode === 'daily') {
   const anchor = Date.parse(shanghaiDay(now) + 'T09:00:00+08:00');
