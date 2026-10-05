@@ -64,16 +64,17 @@ export function classifyError(value: unknown): ReportIssue {
 
 export function reportIssues(report: Report | null | undefined, status?: RunStatus, fallback?: string | null): ReportIssue[] {
   const issues: ReportIssue[] = [];
-  const add = (error: unknown) => {
+  const add = (error: unknown, occurrences: unknown = 1) => {
     if (object(error).code === 'user_paused') return;
     const issue = classifyError(error);
     const existing = issues.find(v => v.code === issue.code && v.httpStatus === issue.httpStatus && v.title === issue.title && v.detail === issue.detail);
-    if (existing) existing.count++; else issues.push(issue);
+    const count = report?.summary_only === true && typeof occurrences === 'number' && Number.isSafeInteger(occurrences) && occurrences > 0 ? occurrences : 1;
+    if (existing) existing.count += count; else { issue.count = count; issues.push(issue); }
   };
   const results = Array.isArray(report?.results) ? report.results : [];
   for (const result of results) {
     const row = object(result);
-    if (row.error && Object.keys(object(row.error)).length) add(row.error);
+    if (row.error && Object.keys(object(row.error)).length) add(row.error, row.count);
   }
   const diagnostics = Array.isArray(report?.diagnostics) ? report.diagnostics : [];
   for (const diagnostic of diagnostics) add(diagnostic);
@@ -82,8 +83,8 @@ export function reportIssues(report: Report | null | undefined, status?: RunStat
   if (!issues.length && Array.isArray(report?.events)) {
     for (const event of report.events) {
       const item = object(event), payload = object(item.payload);
-      if (item.type === 'run_error') add(payload);
-      else if (payload.error) add(payload.error);
+      if (item.type === 'run_error') add(payload, item.count);
+      else if (payload.error) add(payload.error, item.count);
     }
   }
   if (report?.failure && !issues.some(issue => issue.code === report.failure)) add({ code: report.failure });

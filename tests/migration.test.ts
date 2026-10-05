@@ -62,6 +62,21 @@ test('migration refuses an occupied destination and unfinished or scheduled loca
  await assert.rejects(localExport(f.db, f.source, f.destination), /关闭本地自动监测/);
  f.db.close(); dest.close();
 });
+test('migration retains deleted configuration only as report anchors and never restores cleared Keys', async () => {
+ const f = await sourceFixture();
+ f.db.exec("DELETE FROM schedules; DELETE FROM run_presets; UPDATE runs SET key_cipher=''; UPDATE targets SET deleted_at=100; UPDATE endpoints SET deleted_at=100,key_cipher='';");
+ const exported = await localExport(f.db, f.source, f.destination);
+ const dest = new DatabaseSync(':memory:');
+ try {
+  dest.exec(schema + laterMigrations); dest.exec(exported.sql);
+  assert.equal(dest.prepare('SELECT deleted_at FROM targets').get()!.deleted_at, 100);
+  assert.equal(dest.prepare('SELECT deleted_at FROM endpoints').get()!.deleted_at, 100);
+  assert.equal(dest.prepare('SELECT key_cipher FROM endpoints').get()!.key_cipher, '');
+  assert.equal(dest.prepare('SELECT COUNT(*) AS n FROM runs').get()!.n, 2);
+  assert.equal(JSON.parse(dest.prepare("SELECT report FROM runs WHERE id='run'").get()!.report as string).fingerprint.valid_samples, 32);
+  assert.deepEqual(dest.prepare('PRAGMA foreign_key_check').all(), []);
+ } finally { f.db.close(); dest.close(); }
+});
 test('relay names migrate consistently across existing same-URL Key profiles without changing credentials', () => {
  const db = new DatabaseSync(':memory:'); db.exec(schema);
  const insert = db.prepare('INSERT INTO endpoints VALUES (?,?,?,?,?,?,?)');

@@ -27,7 +27,7 @@ export async function localExport(db: DatabaseSync, source: Pick<Env, 'MASTER_KE
   secrets.add(plaintext);
   return encrypt(plaintext, destination as Env, context);
  }
- for (const endpoint of data.endpoints) endpoint.key_cipher = await rekey(endpoint.key_cipher, 'endpoint:' + endpoint.id);
+ for (const endpoint of data.endpoints) if (endpoint.key_cipher) endpoint.key_cipher = await rekey(endpoint.key_cipher, 'endpoint:' + endpoint.id);
  for (const run of data.runs) if (run.key_cipher) run.key_cipher = await rekey(run.key_cipher, 'run:' + run.id);
  if (mail.password_cipher) mail.password_cipher = await rekey(mail.password_cipher, 'smtp');
  data.settings.find(setting => setting.id === 'mail')!.value = JSON.stringify(mail);
@@ -40,11 +40,16 @@ export async function localExport(db: DatabaseSync, source: Pick<Env, 'MASTER_KE
   `INSERT OR REPLACE INTO relay_import_guard VALUES (1,CASE WHEN ${canImport} THEN 1 ELSE 0 END);`,
   `INSERT OR IGNORE INTO settings VALUES ('${importSetting}',${literal(pending)});`,
  ];
+ // Recreate historical FK anchors before marking them deleted again. Live
+ // configuration guards must also stay enabled during a trusted migration.
+ const deleted = ['targets', 'endpoints'].flatMap(table => data[table as 'targets' | 'endpoints'].filter(row => row.deleted_at != null).map(row => ({ table, id: row.id, at: row.deleted_at })));
+ for (const table of ['targets', 'endpoints'] as const) for (const row of data[table]) if (row.deleted_at != null) row.deleted_at = null;
  for (const table of tables) for (const row of data[table]) {
   const columns = Object.keys(row);
   const conflict = table === 'settings' || table === 'groups' ? ' ON CONFLICT(id) DO UPDATE SET ' + columns.filter(column => column !== 'id').map(column => `${column}=excluded.${column}`).join(',') : ' ON CONFLICT DO NOTHING';
   statements.push(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(column => literal(row[column])).join(',')})${conflict};`);
  }
+ for (const value of deleted) statements.push(`UPDATE ${value.table} SET deleted_at=${literal(value.at)} WHERE id=${literal(value.id)};`);
  statements.push(`UPDATE settings SET value=${literal(complete)} WHERE id='${importSetting}';`, 'DROP TABLE relay_import_guard;');
  if (statements.some(statement => Buffer.byteLength(statement) > 100000)) throw new Error('历史报告超过 D1 单条导入限制，请使用分块迁移。');
  const sql = statements.join('\n') + '\n';

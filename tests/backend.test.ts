@@ -10,6 +10,7 @@ import { createLoginCredentials } from '../worker/password.ts';
 import { derivePasswordProof } from '../src/password.ts';
 import { nextDue, safeReport, shanghaiDay } from '../worker/domain.ts';
 import { createRuns, finalizeRunSets, pendingNotices, setting, row, rows } from '../worker/data.ts';
+import { reportIssues } from '../src/diagnostics.ts';
 import type { Env } from '../worker/types.ts';
 const secret = 'sk-private-validation-123456789';
 function fixture() {
@@ -28,7 +29,78 @@ function fixture() {
  const leaseHeaders = (lease: string) => ({ Authorization: 'Bearer ' + lease });
  return { db, env, call, endpoint, target, runnerHeaders, leaseHeaders, pending };
 }
-function report(verdict = 'match', claimed = BASELINES.gpt.models[0]) { return { fingerprint: { verdict, claimed_model: claimed, model: verdict === 'match' ? claimed : null, matches: { [claimed]: .86 }, thresholds: { [claimed]: .65 }, valid_samples: 32, planned_samples: 32, reasons: [] }, progress: { actual_attempts: 32 }, benchmark: { id: BASELINES.gpt.id, version: BASELINES.gpt.version, content_sha256: BASELINES.gpt.sha256 } }; }
+function report(verdict: 'match' | 'mismatch' | 'insufficient' = 'match', claimed = BASELINES.gpt.models[0]) { return { fingerprint: { verdict, claimed_model: claimed, model: verdict === 'match' ? claimed : null, matches: { [claimed]: .86 }, thresholds: { [claimed]: .65 }, valid_samples: 32, planned_samples: 32, reasons: [] }, progress: { actual_attempts: 32 }, benchmark: { id: BASELINES.gpt.id, version: BASELINES.gpt.version, content_sha256: BASELINES.gpt.sha256 } }; }
+test('different models share an existing Key and retrying the same save cannot create duplicate targets', async () => {
+ const f=fixture();
+ try {
+  const endpoint=await f.endpoint();await f.target(endpoint);
+  const before=(await row(f.env,'SELECT key_cipher FROM endpoints WHERE id=?',endpoint))!.key_cipher;
+  const payload={id:crypto.randomUUID(),endpoint_id:endpoint,group_id:'default',name:'同 Key Claude',protocol:'claude',request_model:defaultRequestModel('claude',BASELINES.claude.models[0],'https://api.example.com/v1'),claimed_model:BASELINES.claude.models[0],tier:'low'};
+  for(let i=0;i<3;i++){const saved=await f.call('targets','POST',payload);assert.equal(saved.status,200);assert.equal(saved.data.id,payload.id);}
+  const panel=(await f.call('panel')).data;assert.equal(panel.targets.length,2);assert.equal(panel.endpoints.length,1);
+  assert.equal(panel.targets.find((target:{id:string;endpoint_id:string})=>target.id===payload.id).endpoint_id,endpoint);
+  assert.equal((await row(f.env,'SELECT key_cipher FROM endpoints WHERE id=?',endpoint))!.key_cipher,before);
+  assert.equal((await rows(f.env,'SELECT * FROM schedules')).length,2);
+  assert.equal((await rows(f.env,'SELECT * FROM runs')).length,0);
+ }finally{f.db.close();}
+});
+test('large report history loads lightweight summaries and retrieves complete evidence only on demand', async () => {
+ const f = fixture();
+ try {
+  const endpoint = await f.endpoint(); const target = await f.target(endpoint);
+  const created = await createRuns(f.env, [target], 'low');
+  const original = (await row(f.env, 'SELECT * FROM runs WHERE id=?', created.runIds[0]))!;
+  const error = { code: 'upstream_http_error', http_status: 503, upstream: { message: 'No available capacity' } };
+  const evidence = { ...report('insufficient'), failure: 'samples_incomplete',
+   results: Array.from({ length: 32 }, () => ({ answer: 'sample-payload'.repeat(500), error })),
+   events: Array.from({ length: 100 }, () => ({ type: 'probe_received', payload: { raw: 'event-payload'.repeat(200) } })),
+  };
+  await f.env.DB.prepare("UPDATE runs SET status='completed',report=?,key_cipher='',attempts=32 WHERE id=?").bind(JSON.stringify(evidence), original.id).run();
+  for (let i=1;i<64;i++) await f.env.DB.prepare("INSERT INTO runs(id,batch_id,target_id,status,source,created_at,snapshot,key_cipher,report,attempts,reserved_attempts,quota_day) VALUES (?,?,?,'completed','manual',?,?,'',?,32,48,?)")
+   .bind('large-history-'+i,original.batch_id,target,original.created_at+i,original.snapshot,JSON.stringify(evidence),original.quota_day).run();
+  const panel = await f.call('panel'); assert.equal(panel.status,200); assert.equal(panel.data.runs.length,64);
+  const serialized = JSON.stringify(panel.data);
+  assert.ok(serialized.length < 160000, 'large sample history must not be serialized into the panel');
+  assert.ok(!serialized.includes('sample-payload')); assert.ok(!serialized.includes('event-payload'));
+  assert.ok(!serialized.includes('key_cipher')); assert.ok(!serialized.includes(secret));
+  for (const run of panel.data.runs) {
+   assert.equal(run.report_summary,1);
+   assert.deepEqual(run.report.fingerprint,evidence.fingerprint);
+   assert.deepEqual(run.report.benchmark,evidence.benchmark);
+   assert.deepEqual(reportIssues(run.report,run.status),reportIssues(evidence,run.status));
+   assert.equal(comparisonKey(run),comparisonKey({ ...run, report: evidence }));
+  }
+  const complete = await f.call('reports/'+original.id);
+  assert.equal(complete.status,200); assert.deepEqual(complete.data.run.report,evidence);
+  assert.deepEqual(complete.data.run.snapshot,JSON.parse(original.snapshot));
+  assert.ok(!JSON.stringify(complete.data).includes('key_cipher')); assert.ok(!JSON.stringify(complete.data).includes(secret));
+  assert.equal(complete.data.run.report_summary,undefined);
+  assert.equal((await f.call('reports/missing')).status,404);
+  f.env.DEV_MODE=undefined; assert.equal((await f.call('reports/'+original.id)).status,401);
+ } finally { f.db.close(); }
+});
+test('panel summaries preserve early errors from events, diagnostics and incomplete reports', async () => {
+ const f = fixture();
+ try {
+  const target = await f.target(await f.endpoint()); const created = await createRuns(f.env,[target],'low');
+  const error = { code:'upstream_http_error',http_status:404,upstream:{message:'Model not found'} };
+  const firstError = { code:'upstream_http_error',http_status:500,upstream:{message:'Z gateway error'} };
+  const nextError = { code:'upstream_http_error',http_status:500,upstream:{message:'A gateway error'} };
+  for (const evidence of [
+   {events:[{type:'run_error',payload:error},{type:'run_error',payload:error},{type:'attempt_decision',payload:{error}}]},
+   {results:[{error:firstError},{error:nextError},{error:firstError},{error:nextError}]},
+   {events:[{type:'run_error',payload:firstError},{type:'attempt_decision',payload:{error:nextError}},{type:'run_error',payload:firstError},{type:'attempt_decision',payload:{error:nextError}}]},
+   {diagnostics:[{code:'dns_error',stage:'address_check',message:'No answer'}],failure:'dns_error'},
+   {results:[{error},{error},{error:{code:'user_paused'}}],events:[{type:'run_error',payload:error}]},
+  ]) {
+   await f.env.DB.prepare("UPDATE runs SET status='failed',report=? WHERE id=?").bind(JSON.stringify(evidence),created.runIds[0]).run();
+   const run = (await f.call('panel')).data.runs[0];
+   assert.deepEqual(reportIssues(run.report,run.status),reportIssues(evidence,run.status));
+  }
+  await f.env.DB.prepare('UPDATE runs SET report=NULL WHERE id=?').bind(created.runIds[0]).run();
+  assert.equal((await f.call('reports/'+created.runIds[0])).data.run.report,null);
+ } finally { f.db.close(); }
+});
 test('queued stops cancel exact runs once, release unused budget, and never return cancelled credentials', async () => {
  const f = fixture(); const endpoint = await f.endpoint(); const a = await f.target(endpoint); const b = await f.target(endpoint, 'gpt', '第二个模型');
  const created = (await f.call('runs', 'POST', { targetIds: [a, b], tier: 'low' })).data;
@@ -134,7 +206,7 @@ test('an expired runner with a pending stop preserves evidence and keeps unknown
 test('a paused monitoring round cannot create a false recovery or anomaly notification', async () => {
  const f = fixture(); const target = await f.target(await f.endpoint());
  await f.call('settings/mail', 'PUT', { enabled: true, notify_manual: false, mode: 'changes', host: 'smtp.example.com', port: 465, username: 'from@example.com', from: 'from@example.com', to: 'to@example.com', password: 'fixture-mail-secret' });
- const finish = async (verdict: string) => {
+ const finish = async (verdict: 'match' | 'mismatch' | 'insufficient') => {
   const created = await createRuns(f.env, [target], 'low', 'scheduled');
   const claim = (await f.call(`runner/batches/${created.runId}/claim`, 'POST', {}, f.runnerHeaders)).data;
   await f.call(`runner/batches/${created.runId}/results/${created.runIds[0]}`, 'POST', { status: 'completed', attempts: 32, report: report(verdict) }, f.leaseHeaders(claim.lease));

@@ -14,22 +14,52 @@ export async function usage(env: Env) {
  return { daily_requests: records.find(r => r.kind === 'requests')?.used || 0, monthly_minutes: records.find(r => r.kind === 'minutes')?.used || 0 };
 }
 export function decodeRun(value: Row): Run { const { key_cipher: _key, ...safe } = value; return { ...safe, snapshot: JSON.parse(value.snapshot), report: value.report ? JSON.parse(value.report) : null, progress: value.progress ? JSON.parse(value.progress) : null } as Run; }
+// Reduce reports in D1 before they reach the free Worker's CPU budget. Full
+// sample answers and event logs stay in the database for on-demand viewing.
+const panelReport = `CASE WHEN r.report IS NULL THEN NULL ELSE json_set(
+ json_remove(r.report,'$.results','$.events'),'$.summary_only',json('true'),
+ '$.benchmark',json(CASE WHEN json_type(r.report,'$.benchmark')='object' THEN json_object(
+  'id',json_extract(r.report,'$.benchmark.id'),'version',json_extract(r.report,'$.benchmark.version'),
+  'content_sha256',json_extract(r.report,'$.benchmark.content_sha256')
+ ) ELSE NULL END),
+ '$.results',json((SELECT json_group_array(json_object('error',json(error),'count',n)) FROM (
+  SELECT json_extract(value,'$.error') AS error,COUNT(*) AS n FROM json_each(r.report,'$.results')
+  WHERE json_type(value,'$.error')='object' GROUP BY json_extract(value,'$.error') ORDER BY MIN(CAST(key AS INTEGER))
+ ))),
+ '$.events',json((SELECT json_group_array(json_object('type',type,'payload',json(payload),'count',n)) FROM (
+  SELECT json_extract(value,'$.type') AS type,json_extract(value,'$.payload') AS payload,COUNT(*) AS n
+  FROM json_each(r.report,'$.events')
+  WHERE json_extract(value,'$.type')='run_error' OR json_type(value,'$.payload.error')='object'
+  GROUP BY json_extract(value,'$.type'),json_extract(value,'$.payload') ORDER BY MIN(CAST(key AS INTEGER))
+ )))) END`;
+const publicRunColumns = 'r.id,r.batch_id,r.target_id,r.status,r.source,r.created_at,r.started_at,r.ended_at,r.stop_requested_at,r.attempts,r.reserved_attempts,r.snapshot,r.progress,r.error';
+export async function fullReportJson(env: Env, runId: string): Promise<string | null> {
+ // Let D1 serialize one complete report, avoiding another parse/stringify pass
+ // through large sample payloads inside the Worker. Credentials are excluded.
+ const result = await row(env, `SELECT json_object(
+  'id',id,'batch_id',batch_id,'target_id',target_id,'status',status,'source',source,
+  'created_at',created_at,'started_at',started_at,'ended_at',ended_at,'stop_requested_at',stop_requested_at,
+  'attempts',attempts,'reserved_attempts',reserved_attempts,'snapshot',json(snapshot),
+  'progress',json(progress),'report',json(report),'error',error
+ ) AS value FROM runs WHERE id=?`, runId);
+ return result?.value ?? null;
+}
 export function executionReady(env: Env) { return env.DEV_MODE === 'local' ? env.LOCAL_PREVIEW_ONLY !== '1' && env.LOCAL_RUNNER_READY === '1' : !!(env.GITHUB_DISPATCH_TOKEN && env.GITHUB_REPOSITORY && !env.GITHUB_REPOSITORY.includes('REPLACE_')); }
 export async function panel(env: Env) {
  const [groups, endpoints, targets, schedules, runs, limits, mail, counts, mailError, mailTest, runSets, runPresets, presetMembers] = await Promise.all([
   rows(env, 'SELECT * FROM groups ORDER BY created_at'),
-  rows(env, 'SELECT id,group_id,name,station_name,base_url,created_at,updated_at FROM endpoints ORDER BY created_at'),
-  rows(env, 'SELECT * FROM targets ORDER BY created_at'), rows(env, 'SELECT * FROM schedules'),
+  rows(env, 'SELECT id,group_id,name,station_name,base_url,created_at,updated_at FROM endpoints WHERE deleted_at IS NULL ORDER BY created_at'),
+  rows(env, 'SELECT id,endpoint_id,name,protocol,request_model,claimed_model,tier,created_at FROM targets WHERE deleted_at IS NULL ORDER BY created_at'), rows(env, 'SELECT s.* FROM schedules s JOIN targets t ON t.id=s.target_id WHERE t.deleted_at IS NULL'),
   rows(env, `WITH applicable AS (
    SELECT r.id,r.status,
     ROW_NUMBER() OVER(PARTITION BY r.target_id ORDER BY r.created_at DESC,r.id DESC) AS latest,
     ROW_NUMBER() OVER(PARTITION BY r.target_id,r.status NOT IN ('queued','running') ORDER BY r.created_at DESC,r.id DESC) AS last_finished,
     ROW_NUMBER() OVER(PARTITION BY r.target_id,r.status NOT IN ('queued','running','cancelled') ORDER BY r.created_at DESC,r.id DESC) AS last_evidence
    FROM runs r JOIN targets t ON t.id=r.target_id JOIN endpoints e ON e.id=t.endpoint_id
-   WHERE json_extract(r.snapshot,'$.endpoint_id')=e.id AND json_extract(r.snapshot,'$.base_url')=e.base_url
+   WHERE t.deleted_at IS NULL AND e.deleted_at IS NULL AND json_extract(r.snapshot,'$.endpoint_id')=e.id AND json_extract(r.snapshot,'$.base_url')=e.base_url
     AND json_extract(r.snapshot,'$.protocol')=t.protocol AND json_extract(r.snapshot,'$.request_model')=t.request_model
     AND json_extract(r.snapshot,'$.claimed_model')=t.claimed_model
-  ) SELECT * FROM runs WHERE status IN ('queued','running')
+  ) SELECT ${publicRunColumns},${panelReport} AS report,1 AS report_summary FROM runs r WHERE status IN ('queued','running')
    OR id IN (SELECT id FROM runs ORDER BY created_at DESC LIMIT 200)
    OR id IN (SELECT id FROM applicable WHERE latest=1 OR (last_finished=1 AND status NOT IN ('queued','running')) OR (last_evidence=1 AND status NOT IN ('queued','running','cancelled')))
    OR id IN (SELECT m.run_id FROM run_set_members m JOIN run_sets s ON s.id=m.set_id WHERE s.superseded_by IS NULL AND
@@ -80,7 +110,7 @@ export async function createRuns(env: Env, targetIds: string[], overrideTier?: T
   const runIds = active.map(r => r.id); const setId = await attachRunSet(env, runIds, source);
   return { runId: active[0].batch_id, batchIds: [...new Set(active.map(r => r.batch_id))], runIds, setId, reused: true };
  }
- const selected = await rows(env, 'SELECT t.*,e.name AS endpoint_name,e.station_name,e.base_url,e.key_cipher,e.group_id,g.name AS group_name FROM targets t JOIN endpoints e ON t.endpoint_id=e.id JOIN groups g ON e.group_id=g.id WHERE t.id IN (SELECT value FROM json_each(?))', JSON.stringify(remaining));
+ const selected = await rows(env, 'SELECT t.*,e.name AS endpoint_name,e.station_name,e.base_url,e.key_cipher,e.group_id,g.name AS group_name FROM targets t JOIN endpoints e ON t.endpoint_id=e.id JOIN groups g ON e.group_id=g.id WHERE t.deleted_at IS NULL AND e.deleted_at IS NULL AND t.id IN (SELECT value FROM json_each(?))', JSON.stringify(remaining));
  if (selected.length !== remaining.length) throw new ApiError('检测目标不存在', 404);
  const order = new Map(remaining.map((target, index) => [target, index])); selected.sort((a, b) => order.get(a.id)! - order.get(b.id)!);
  const batchIds = Array.from({ length: Math.ceil(selected.length / DETECTION_BATCH_SIZE) }, () => id());
@@ -109,6 +139,7 @@ export async function createRuns(env: Env, targetIds: string[], overrideTier?: T
  ];
  try { await env.DB.batch(statements); } catch (error) {
   // 数据库唯一索引负责并发去重；整批事务失败时预算也回滚。
+  if (String(error).includes('configuration_deleted')) throw new ApiError('所选模型已删除，请刷新后重新选择', 404);
   if (String(error).includes('UNIQUE')) {
    const concurrent = await rows(env, "SELECT * FROM runs WHERE target_id IN (SELECT value FROM json_each(?)) AND status IN ('queued','running')", JSON.stringify(targetIds));
    if (concurrent.length === targetIds.length) {

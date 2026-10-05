@@ -1,8 +1,9 @@
 import { ApiError, type Env, type Context } from './types.ts';
 import { decrypt, encrypt, ensurePublicHostname, integerValue, localRequest, publicUrl, sameOrigin, session, sign, textValue, verifyOidc } from './security.ts';
+import { deleteConfiguration } from './configuration-delete.ts';
 import { clearLoginAttempts, loginCredentials, reserveLoginAttempt, verifyLoginProof } from './password.ts';
 import { mailRecipients, manualMailEnabled, nextDue, protocolValue, safeReport, shanghaiDay, tierValue } from './domain.ts';
-import { claim, createRuns, decodeRun, dispatch, dispatchQueued, executionReady, expireBatches, finishBatch, finishRun, finalizeRunSets, id, noticeAllowed, noticeInBatch, panel, pendingNotices, requireLease, row, rows, saveSetting, setting, stopRuns, usage } from './data.ts';
+import { claim, createRuns, decodeRun, dispatch, dispatchQueued, executionReady, expireBatches, finishBatch, finishRun, finalizeRunSets, fullReportJson, id, noticeAllowed, noticeInBatch, panel, pendingNotices, requireLease, row, rows, saveSetting, setting, stopRuns, usage } from './data.ts';
 import { BASELINES, baselineFor, defaultRequestModel, type Limits, type MailSettings, type Protocol } from '../src/shared.ts';
 type Json = Record<string, any>;
 function json(value: unknown, status = 200, headers: Record<string, string> = {}) { return Response.json(value, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...headers } }); }
@@ -32,6 +33,11 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
   if (!['GET', 'HEAD'].includes(request.method)) sameOrigin(request, env);
   if (path === '/api/auth/logout' && request.method === 'POST') return json({ ok: true }, 200, { 'Set-Cookie': '__Host-relay_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0' });
   if (path === '/api/panel' && request.method === 'GET') return json(await panel(env));
+  if (/^\/api\/reports\/[^/]+$/.test(path) && request.method === 'GET') {
+   const report = await fullReportJson(env, path.split('/')[3]);
+   if (report === null) throw new ApiError('报告不存在', 404);
+   return new Response(`{"run":${report}}`, { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
+  }
   if (path === '/api/run-presets' && request.method === 'POST') {
    const b = await body(request, 1200000);
    if (Object.keys(b).some(field => !['id', 'name', 'targetIds'].includes(field))) throw new ApiError('常用组合包含不支持的设置');
@@ -39,8 +45,8 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    const name = textValue(b.name, '组合名称', 64);
    if (b.id !== undefined && !await row(env, 'SELECT id FROM run_presets WHERE id=?', presetId)) throw new ApiError('常用组合不存在，请刷新后重试', 404);
    const targetIds = selectedIds(b.targetIds, '模型'); const selection = JSON.stringify(targetIds);
-   const selected = await rows(env, 'SELECT DISTINCT e.id,e.key_cipher FROM targets t JOIN endpoints e ON e.id=t.endpoint_id WHERE t.id IN (SELECT value FROM json_each(?))', selection);
-   const existing = await rows(env, 'SELECT id FROM targets WHERE id IN (SELECT value FROM json_each(?))', selection);
+   const selected = await rows(env, 'SELECT DISTINCT e.id,e.key_cipher FROM targets t JOIN endpoints e ON e.id=t.endpoint_id WHERE t.deleted_at IS NULL AND e.deleted_at IS NULL AND t.id IN (SELECT value FROM json_each(?))', selection);
+   const existing = await rows(env, 'SELECT id FROM targets WHERE deleted_at IS NULL AND id IN (SELECT value FROM json_each(?))', selection);
    if (existing.length !== targetIds.length) throw new ApiError('组合中的模型已不存在，请刷新后重新选择', 404);
    for (const endpoint of selected) if (name.includes(await decrypt(endpoint.key_cipher, env, 'endpoint:' + endpoint.id))) throw new ApiError('组合名称不能包含 API Key');
    if (b.id === undefined && (await row(env, 'SELECT COUNT(*) AS n FROM run_presets'))!.n >= 20) throw new ApiError('最多保存二十个常用组合，请编辑已有组合');
@@ -68,34 +74,39 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    if (!await row(env, 'SELECT id FROM groups WHERE id=?', groupId)) throw new ApiError('分组不存在', 404);
    await env.DB.batch([env.DB.prepare("UPDATE endpoints SET group_id='default' WHERE group_id=?").bind(groupId), env.DB.prepare('DELETE FROM groups WHERE id=?').bind(groupId)]); return json({ ok: true });
   }
+  if (/^\/api\/(stations|endpoints|targets)\/[^/]+$/.test(path) && request.method === 'DELETE') {
+   const resource = path.split('/')[2];
+   return json(await deleteConfiguration(env, resource === 'stations' ? 'station' : resource === 'endpoints' ? 'key' : 'model', path.split('/')[3], await body(request, 1200000)));
+  }
   if (path === '/api/endpoints' && request.method === 'POST') {
    const b = await body(request); const endpointId = b.id || id(); const existing = await row(env, 'SELECT * FROM endpoints WHERE id=?', endpointId);
+   if (existing?.deleted_at !== null && existing?.deleted_at !== undefined) throw new ApiError('这条 Key 配置已删除，请刷新后重新添加', 404);
    const name = textValue(b.name, 'Key 配置名称'); const base = publicUrl(b.base_url); const groupId = textValue(b.group_id || 'default', '分组');
    if (!await row(env, 'SELECT id FROM groups WHERE id=?', groupId)) throw new ApiError('分组不存在');
    const key = typeof b.key === 'string' && b.key.trim() ? textValue(b.key, 'API Key', 4096) : '';
    if (!existing && !key) throw new ApiError('首次保存需要填写 API Key');
    if (existing && existing.base_url !== base && !key) throw new ApiError('修改 API 地址后，需要重新填写对应的 API Key');
    const secret = key || (existing ? await decrypt(existing.key_cipher, env, 'endpoint:' + endpointId) : '');
-   const sameStation = await row(env, 'SELECT station_name FROM endpoints WHERE base_url=? ORDER BY created_at,id LIMIT 1', base);
+   const sameStation = await row(env, 'SELECT station_name FROM endpoints WHERE base_url=? AND deleted_at IS NULL ORDER BY created_at,id LIMIT 1', base);
    const stationName = sameStation?.station_name || existing?.station_name || textValue(b.station_name ?? name, '中转站名称');
    if ([name, stationName, base, groupId].some(v => v.includes(secret))) throw new ApiError('名称或地址中不能包含 API Key');
    const cipher = key ? await encrypt(key, env, 'endpoint:' + endpointId) : existing!.key_cipher;
    await env.DB.prepare('INSERT INTO endpoints(id,group_id,name,station_name,base_url,key_cipher,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET group_id=excluded.group_id,name=excluded.name,station_name=excluded.station_name,base_url=excluded.base_url,key_cipher=excluded.key_cipher,updated_at=excluded.updated_at').bind(endpointId, groupId, name, stationName, base, cipher, Date.now(), Date.now()).run(); return json({ id: endpointId, credential_saved: true });
   }
   if (/^\/api\/stations\/[^/]+$/.test(path) && request.method === 'PUT') {
-   const anchor = await row(env, 'SELECT * FROM endpoints WHERE id=?', path.split('/')[3]);
+   const anchor = await row(env, 'SELECT * FROM endpoints WHERE id=? AND deleted_at IS NULL', path.split('/')[3]);
    if (!anchor) throw new ApiError('中转站不存在', 404);
    const b = await body(request); const name = textValue(b.name, '中转站名称'); const base = publicUrl(b.base_url);
    if (b.previous_base_url !== anchor.base_url) throw new ApiError('中转站地址已被修改，请关闭后重新打开编辑。', 409);
    const changedUrl = base !== anchor.base_url;
    if (changedUrl && b.confirm_url_change !== true) throw new ApiError('请确认此中转站的所有 Key 配置都改用新地址');
-   if (changedUrl && await row(env, 'SELECT id FROM endpoints WHERE base_url=? LIMIT 1', base)) throw new ApiError('新地址已属于另一家中转站，请编辑对应中转站，避免合并配置。', 409);
-   const profiles = await rows(env, 'SELECT id,key_cipher FROM endpoints WHERE base_url=?', anchor.base_url);
+   if (changedUrl && await row(env, 'SELECT id FROM endpoints WHERE base_url=? AND deleted_at IS NULL LIMIT 1', base)) throw new ApiError('新地址已属于另一家中转站，请编辑对应中转站，避免合并配置。', 409);
+   const profiles = await rows(env, 'SELECT id,key_cipher FROM endpoints WHERE base_url=? AND deleted_at IS NULL', anchor.base_url);
    for (const profile of profiles) {
     const secret = await decrypt(profile.key_cipher, env, 'endpoint:' + profile.id);
     if ([name, base].some(value => value.includes(secret))) throw new ApiError('名称或地址中不能包含 API Key');
    }
-   await env.DB.prepare('UPDATE endpoints SET station_name=?,base_url=?,updated_at=? WHERE base_url=?').bind(name, base, Date.now(), anchor.base_url).run();
+   await env.DB.prepare('UPDATE endpoints SET station_name=?,base_url=?,updated_at=? WHERE base_url=? AND deleted_at IS NULL').bind(name, base, Date.now(), anchor.base_url).run();
    return json({ ok: true, profiles_updated: profiles.length, base_url: base });
   }
   if (path === '/api/targets/batch' && request.method === 'POST') {
@@ -115,7 +126,7 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    const claimedChange = Object.hasOwn(changes, 'claimed_model') ? textValue(changes.claimed_model, '申报模型') : undefined;
    const requestChange = Object.hasOwn(changes, 'request_model') ? textValue(changes.request_model, '实际请求模型') : undefined;
    const updates = []; const secrets = new Map<string, string>();
-   const targets = await rows(env, 'SELECT t.*,e.base_url,e.key_cipher FROM targets t JOIN endpoints e ON e.id=t.endpoint_id WHERE t.id IN (SELECT value FROM json_each(?))', JSON.stringify(targetIds));
+   const targets = await rows(env, 'SELECT t.*,e.base_url,e.key_cipher FROM targets t JOIN endpoints e ON e.id=t.endpoint_id WHERE t.deleted_at IS NULL AND e.deleted_at IS NULL AND t.id IN (SELECT value FROM json_each(?))', JSON.stringify(targetIds));
    if (targets.length !== targetIds.length) throw new ApiError('所选检测目标或对应站点不存在，请刷新后重新选择', 404);
    for (const target of targets) {
     if (!protocolChange && (typeof target.protocol !== 'string' || !Object.hasOwn(BASELINES, target.protocol))) throw new ApiError('所选目标的请求协议不正确，请选择新的协议');
@@ -139,7 +150,9 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    return json({ ok: true, updated: updates.length });
   }
   if (path === '/api/targets' && request.method === 'POST') {
-   const b = await body(request); const targetId = b.id || id(); const endpoint = await row(env, 'SELECT * FROM endpoints WHERE id=?', b.endpoint_id); if (!endpoint) throw new ApiError('请先保存站点');
+   const b = await body(request); const targetId = b.id || id();
+   if (await row(env, 'SELECT id FROM targets WHERE id=? AND deleted_at IS NOT NULL', targetId)) throw new ApiError('这个模型已删除，请刷新后重新添加', 404);
+   const endpoint = await row(env, 'SELECT * FROM endpoints WHERE id=? AND deleted_at IS NULL', b.endpoint_id); if (!endpoint) throw new ApiError('请先保存站点');
    const protocol = protocolValue(b.protocol); const name = textValue(b.name, '目标名称'); const model = textValue(b.request_model, '实际请求模型'); const claimed = textValue(b.claimed_model, '申报模型'); const tier = tierValue(b.tier || 'medium');
    const secret = await decrypt(endpoint.key_cipher, env, 'endpoint:' + endpoint.id);
    if ([name, model, claimed].some(v => v.includes(secret))) throw new ApiError('模型配置中不能包含 API Key');
@@ -152,7 +165,7 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    ]); return json({ id: targetId });
   }
   if (path === '/api/models' && request.method === 'POST') {
-   const b = await body(request); const endpoint = await row(env, 'SELECT * FROM endpoints WHERE id=?', b.endpoint_id); if (!endpoint) throw new ApiError('站点不存在', 404);
+   const b = await body(request); const endpoint = await row(env, 'SELECT * FROM endpoints WHERE id=? AND deleted_at IS NULL', b.endpoint_id); if (!endpoint) throw new ApiError('站点不存在', 404);
    const key = await decrypt(endpoint.key_cipher, env, 'endpoint:' + endpoint.id); const base = publicUrl(endpoint.base_url); await ensurePublicHostname(base);
    const response = await fetch(base.replace(/\/(responses|messages|chat\/completions)$/, '') + '/models', { headers: { Authorization: 'Bearer ' + key, 'x-api-key': key, 'anthropic-version': '2023-06-01' }, redirect: 'error', signal: AbortSignal.timeout(15000) });
    if (!response.ok) throw new ApiError(`获取模型失败（HTTP ${response.status}），可以手动填写模型名。`, 502);
@@ -176,7 +189,7 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    return json({ batch, runs: (await rows(env, 'SELECT * FROM runs WHERE batch_id=? ORDER BY created_at', batch.id)).map(decodeRun) });
   }
   if (/^\/api\/schedules\/[^/]+$/.test(path) && request.method === 'PUT') {
-   const targetId = path.split('/')[3]; if (!await row(env, 'SELECT id FROM targets WHERE id=?', targetId)) throw new ApiError('目标不存在', 404);
+   const targetId = path.split('/')[3]; if (!await row(env, 'SELECT id FROM targets WHERE id=? AND deleted_at IS NULL', targetId)) throw new ApiError('目标不存在', 404);
    const b = await body(request); if (typeof b.enabled !== 'boolean') throw new ApiError('监测开关不正确');
    const kind = b.kind === 'daily' ? 'daily' : 'interval'; const interval = integerValue(b.interval_minutes ?? 360, '监测间隔（分钟）', 5, 43200); const tier = tierValue(b.tier || 'low'); const time = b.daily_time || '09:00';
    if (typeof time !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) throw new ApiError('每日检测时间不正确');
@@ -219,7 +232,10 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
    ctx.waitUntil(tick(env)); return json(notice, 202);
   }
   throw new ApiError('接口不存在', 404);
- } catch (error) { return json({ error: error instanceof ApiError ? error.message : '操作暂时失败，请稍后重试。' }, error instanceof ApiError ? error.status : 500); }
+ } catch (error) {
+  if (!(error instanceof ApiError) && /configuration_(deleted|changed|in_use)/.test(String(error))) return json({ error: '配置或检测状态已变化，请刷新后重试；未完成部分删除。' }, 409);
+  return json({ error: error instanceof ApiError ? error.message : '操作暂时失败，请稍后重试。' }, error instanceof ApiError ? error.status : 500);
+ }
 }
 async function runnerRoute(request: Request, env: Env, path: string, ctx: Context) {
  if (path === '/api/runner/queue' && request.method === 'GET') { if (!localRequest(request, env)) throw new ApiError('接口不存在', 404); await verifyOidc(request, env); return json({ batches: await rows(env, "SELECT id FROM batches WHERE status='queued' ORDER BY created_at LIMIT 1") }); }
@@ -272,7 +288,7 @@ async function runnerRoute(request: Request, env: Env, path: string, ctx: Contex
 export async function tick(env: Env) {
  await expireBatches(env);
  if (!executionReady(env)) return;
- const now = Date.now(); const due = await rows(env, 'SELECT s.*,t.protocol,t.claimed_model,t.name AS target_name FROM schedules s JOIN targets t ON t.id=s.target_id WHERE s.enabled=1 AND s.next_due<=? ORDER BY s.next_due', now);
+ const now = Date.now(); const due = await rows(env, 'SELECT s.*,t.protocol,t.claimed_model,t.name AS target_name FROM schedules s JOIN targets t ON t.id=s.target_id WHERE t.deleted_at IS NULL AND s.enabled=1 AND s.next_due<=? ORDER BY s.next_due', now);
  const supported = []; const advances: { target_id: string; next_due: number; last_error: string | null }[] = [];
  const advance = (s: Json, last_error: string | null) => ({ target_id: s.target_id as string, next_due: nextDue({ kind: s.kind, interval_minutes: s.interval_minutes, daily_time: s.daily_time }, now), last_error });
  for (const s of due) {
