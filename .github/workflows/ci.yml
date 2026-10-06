@@ -36,3 +36,28 @@ jobs:
         run: python -m unittest discover -s tests -p 'test_*.py'
       - name: Typecheck and production build
         run: npm run build
+      - name: Original Python and WASM app parity
+        run: npm run app:verify
+      - name: Build native app frontend
+        run: node scripts/app.mjs web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-frontend
+          path: native-dist/
+          retention-days: 3
+
+  native-tests:
+    needs: validate
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.app-build/target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-frontend
+          path: native-dist/
+      - uses: dtolnay/rust-toolchain@stable
+      - name: macOS native persistence and file-protection tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib

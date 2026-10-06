@@ -21,3 +21,13 @@ output/
 *.sqlite3-wal
 *.sqlite3-shm
 *.log
+.app-build/
+native-dist/
+src-tauri/target/
+src-tauri/gen/
+release/
+*.p12
+*.pfx
+*.mobileprovision
+*.keystore
+*.jks

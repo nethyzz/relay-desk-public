@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Relay Desk",
+  "version": "1.1.0",
+  "identifier": "com.relaydesk.local",
+  "build": { "frontendDist": "../native-dist", "devUrl": "http://127.0.0.1:1420" },
+  "app": {
+    "windows": [{ "label": "main", "title": "Relay Desk · 本地模型检测", "width": 1280, "height": 840, "minWidth": 360, "minHeight": 540 }],
+    "security": { "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": ["icons/icon.png", "icons/icon.icns", "icons/icon.ico"],
+    "copyright": "Relay Desk contributors · includes meow LLM Detector 4.5.4",
+    "shortDescription": "本地保存与运行的私人模型检测应用",
+    "category": "DeveloperTool",
+    "macOS": { "minimumSystemVersion": "13.3", "signingIdentity": "-" },
+    "windows": { "nsis": { "displayLanguageSelector": true, "languages": ["SimpChinese", "English"] } }
+  }
+}

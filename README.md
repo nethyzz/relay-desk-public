@@ -2,7 +2,7 @@
 
 # Relay Desk · 私人模型检测面板
 
-面向个人使用的模型行为指纹检测与监测工作台。把多个中转站、多个 API Key、GPT / Claude 模型、定时监测和历史报告集中管理，支持电脑与手机访问。
+面向个人使用的模型行为指纹检测与监测工作台。把多个中转站、多个 API Key、GPT / Claude 模型、定时监测和历史报告集中管理，提供本地应用与网页部署两种运行方式。
 
 **面板设计与集成维护：[nethyzz](https://github.com/nethyzz)**  
 **检测内核原作者：[chen-006](https://github.com/chen-006) 及上游贡献者**  
@@ -12,9 +12,31 @@ Relay Desk 提供界面、配置管理、任务调度、预算控制与通知；
 
 > 检测结果是模型行为的指纹证据。匹配百分比不能解释为「降智百分比」、身份概率或服务可用率；它也不能单独证明服务商故意替换了模型。
 
-[快速开始](#快速开始) · [使用指南](docs/USAGE.md) · [云端部署](docs/DEPLOYMENT.md) · [原作者与第三方声明](THIRD_PARTY_NOTICES.md) · [更新记录](CHANGELOG.md)
+[下载软件](#下载与安装本地应用) · [源码快速开始](#快速开始) · [使用指南](docs/USAGE.md) · [应用安装与备份](docs/cross-platform-apps.md) · [云端部署](docs/DEPLOYMENT.md) · [原作者与第三方声明](THIRD_PARTY_NOTICES.md)
 
-当前发布：[v1.2.0](https://github.com/nethyzz/relay-desk-public/releases/tag/v1.2.0)。新增中转站、Key 与模型删除，保留历史报告，并优化报告按需加载和保存反馈；已有部署的升级步骤见 [部署指南](docs/DEPLOYMENT.md#升级到-120)。
+当前发布：[v1.3.0 · 本地应用](https://github.com/nethyzz/relay-desk-public/releases/tag/v1.3.0)。本次公开源码版本为 1.3.0，随附已在本机制作并验证的本地应用 1.1.0；两者分别编号。原有网页模式继续提供，更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 下载与安装本地应用
+
+**直接使用软件无需安装 Python、Node、Rust，也无需配置 Cloudflare 或 GitHub 后台。** 界面、原版 Python 检测引擎和 SQLite 随安装包提供；站点、Key、报告和设置保存到本设备，检测直接连接自己的模型 API。
+
+| 下载 | 适用范围 |
+| --- | --- |
+| [Mac 安装包（DMG，推荐）](https://github.com/nethyzz/relay-desk-public/releases/download/v1.3.0/Relay-Desk-1.1.0-macos-arm64.dmg) | Apple Silicon Mac（M 系列），macOS 13.3 或更新版本 |
+| [Mac 应用 ZIP](https://github.com/nethyzz/relay-desk-public/releases/download/v1.3.0/Relay-Desk-1.1.0-macos-arm64.app.zip) | 与 DMG 相同的应用，可解压后放入“应用程序” |
+| [共享应用源码与离线运行资源](https://github.com/nethyzz/relay-desk-public/releases/download/v1.3.0/relay-desk-v1.3.0-native-source.zip) | 面向开发者；Windows、Android、iPhone 尚未交付安装包 |
+
+1. 下载 DMG，打开后将 Relay Desk 拖入“应用程序”，再启动应用。
+2. 在「站点与模型」添加自己的 HTTPS API 地址、Key 和检测模型，再在总览发起检测。
+3. 在「设置 → 本机数据与备份」导出密码加密的备份；跨设备迁移需手动恢复，网页端数据不会自动迁入 App。
+
+本包使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple 公证。系统若阻止首次打开，请核对下载来源与 SHA-256，并按系统「隐私与安全性」提示操作。安装、备份、数据目录和卸载步骤见 [本地应用指南](docs/cross-platform-apps.md)；下载校验值随 Release 提供。
+
+随附 [第三方许可包](https://github.com/nethyzz/relay-desk-public/releases/download/v1.3.0/THIRD_PARTY_LICENSES.zip) 保留原作者与依赖声明。软件包含 chen-006 及贡献者的 meow 4.5.4 原版内核，按 PolyForm Noncommercial 1.0.0 用于个人非商业使用。
+
+**自动监测需要应用保持打开；手机检测需要保持前台。** 退出、休眠或系统终止后不保证继续执行。Windows、Android 和 iPhone / iPad 当前提供共享工程与构建说明，尚未完成相应平台的安装与真机验证。
+
+![Mac 本地应用界面，使用虚拟测试数据](docs/assets/mac-app.png)
 
 ## 程序介绍
 
@@ -33,16 +55,19 @@ Relay Desk 提供界面、配置管理、任务调度、预算控制与通知；
 | 预算管理 | 请求数与 runner 分钟限额、并发任务复用、请求与重试预留 |
 | 私人访问 | 云端邮箱密码登录、凭据加密、报告登录可见、移动端 PWA |
 
-本地模式使用 Node.js API、SQLite 与本机 Python 执行器；云端模式使用 Cloudflare Workers + D1，以及你自己拥有的私有 GitHub Actions 执行仓库。
+本地应用使用 Tauri、Pyodide 和 SQLite 在设备上运行；源码网页预览使用 Node.js API、SQLite 与本机 Python 执行器；云端模式使用 Cloudflare Workers + D1，以及你自己拥有的私有 GitHub Actions 执行仓库。云端数据在登录设备间共享，本地应用通过加密备份手动迁移。
 
 ```mermaid
 flowchart LR
+    App[Tauri 本地应用] --> LocalDB[本设备 SQLite]
+    App --> Wasm[Pyodide 中的原版 Python 内核]
+    Wasm --> Provider[用户配置的模型 API]
     Browser[电脑或手机浏览器] --> Panel[Relay Desk 面板]
     Panel --> Database[SQLite 本地 / D1 云端]
     Panel --> Queue[自动分批队列 · 每批最多 20 个目标]
     Queue --> Runner[本机 Python / 私有 GitHub Actions]
     Runner --> Engine[原版 meow LLM Detector 4.5.4]
-    Engine --> Provider[用户配置的模型 API]
+    Engine --> Provider
     Runner --> Reports[报告回传与可选 SMTP 通知]
     Reports --> Panel
 ```
@@ -115,14 +140,25 @@ npm run build
 
 Python 对照测试使用合成响应，比对适配层与原版内核；不调用真实模型 API，也不消耗模型账户额度。GitHub CI 执行安装、固定内核校验、TypeScript 测试、Python 对照测试和生产构建。
 
+应用开发还需要 Rust 1.89+ 和目标平台 SDK，详见 [应用构建说明](docs/cross-platform-apps.md#构建和清理)。首次准备可运行 `npm run upstream:install`，随后使用：
+
+```bash
+npm run app:doctor
+npm run app:verify
+npm run app:build
+```
+
+`app:verify` 使用合成响应核对原版 Python 与 WASM 的检测结果、协议传输、取消和 SQLite 保存恢复。GitHub CI 还验证应用前端与 macOS Rust 原生测试；这不代表已完成其他平台的设备测试。
+
 | 目录 | 内容 |
 | --- | --- |
 | `src/`、`public/` | React 界面、移动端资源与图标 |
 | `worker/`、`migrations/` | Worker API、鉴权、加密与数据库迁移 |
 | `runner/` | 原版内核的执行与邮件适配层、上游版本清单 |
+| `apps/local/`、`src-tauri/` | 设备上的 Python / WASM 适配、备份与 Tauri 原生工程 |
 | `scripts/` | 本地启动、内核下载、部署与迁移脚本 |
 | `tests/` | 行为、鉴权、批量操作、调度和原版内核对照测试 |
-| `docs/` | 使用与云端部署文档 |
+| `docs/` | 使用、本地应用安装与云端部署文档 |
 
 `npm run deploy:check` 用于已经填写部署参数的目录；公开模板含占位符，尚未配置时该检查会提示部署条件未满足。
 

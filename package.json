@@ -1,7 +1,7 @@
 {
   "name": "relay-desk",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.3.0",
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev.mjs",
@@ -14,23 +14,34 @@
     "setup:local": "node scripts/setup-local.mjs",
     "configure": "node scripts/configure.mjs",
     "configure:login": "node --experimental-strip-types scripts/configure-login.mjs",
-    "migrate:local": "node --experimental-strip-types scripts/migrate-local.mjs"
+    "migrate:local": "node --experimental-strip-types scripts/migrate-local.mjs",
+    "app:doctor": "node scripts/app.mjs doctor",
+    "app:prepare": "node scripts/app.mjs prepare",
+    "app:verify": "node scripts/app.mjs verify",
+    "app:build": "node scripts/app.mjs build",
+    "app:preview": "node scripts/app.mjs preview",
+    "app:android": "node scripts/app.mjs android",
+    "app:ios": "node scripts/app.mjs ios",
+    "app:clean": "node scripts/app.mjs clean"
   },
   "dependencies": {
+    "@tauri-apps/api": "2.12.1",
     "lucide-react": "0.468.0",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "2.12.1",
     "@types/node": "22.20.2",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.5",
+    "pyodide": "0.28.3",
     "typescript": "5.9.3",
     "undici": "7.29.1",
     "vite": "7.3.6",
     "wrangler": "4.146.0"
   },
-  "description": "Private model fingerprint monitoring dashboard powered by the original meow LLM Detector.",
+  "description": "私人模型行为指纹检测面板及本地应用；集成 chen-006 的 meow LLM Detector",
   "author": "nethyzz",
   "license": "PolyForm-Noncommercial-1.0.0",
   "repository": {

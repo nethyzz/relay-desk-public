@@ -7,6 +7,10 @@ function serviceError(status: number, resourceLimit = false) {
  return `面板服务返回了无效响应（HTTP ${status}），请稍后重试。`;
 }
 export async function api<T>(path: string, method = 'GET', value?: unknown): Promise<T> {
+ if (import.meta.env?.VITE_LOCAL_APP === '1') {
+  const { localAPI } = await import('../apps/local/client.ts');
+  return localAPI<T>(path, method, value);
+ }
  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 20000);
  try {
   const response = await fetch('/api/' + path, { method, credentials: 'same-origin', signal: controller.signal, headers: { Accept: 'application/json', ...(value !== undefined ? { 'Content-Type': 'application/json' } : {}) }, body: value !== undefined ? JSON.stringify(value) : undefined });

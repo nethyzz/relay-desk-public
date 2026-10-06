@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src", "worker", "scripts/*.ts", "tests/*.ts", "vite.config.ts"]
+  "include": ["src", "worker", "scripts/*.ts", "tests/*.ts", "apps/local/*.ts", "vite*.config.ts"]
 }
