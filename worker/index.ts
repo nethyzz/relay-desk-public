@@ -1,6 +1,7 @@
 import { ApiError, type Env, type Context } from './types.ts';
 import { decrypt, encrypt, ensurePublicHostname, integerValue, localRequest, publicUrl, sameOrigin, session, sign, textValue, verifyOidc } from './security.ts';
 import { deleteConfiguration } from './configuration-delete.ts';
+import { cloneTargets } from './target-clone.ts';
 import { clearLoginAttempts, loginCredentials, reserveLoginAttempt, verifyLoginProof } from './password.ts';
 import { mailRecipients, manualMailEnabled, nextDue, protocolValue, safeReport, shanghaiDay, tierValue } from './domain.ts';
 import { claim, createRuns, decodeRun, dispatch, dispatchQueued, executionReady, expireBatches, finishBatch, finishRun, finalizeRunSets, fullReportJson, id, noticeAllowed, noticeInBatch, panel, pendingNotices, requireLease, row, rows, saveSetting, setting, stopRuns, usage } from './data.ts';
@@ -149,6 +150,7 @@ export async function handleRequest(request: Request, env: Env, ctx: Context): P
     WHERE id IN (SELECT json_extract(value,'$.id') FROM changes)`).bind(JSON.stringify(updates)).run();
    return json({ ok: true, updated: updates.length });
   }
+  if (path === '/api/targets/clone' && request.method === 'POST') return json(await cloneTargets(env, await body(request, 1200000)));
   if (path === '/api/targets' && request.method === 'POST') {
    const b = await body(request); const targetId = b.id || id();
    if (await row(env, 'SELECT id FROM targets WHERE id=? AND deleted_at IS NOT NULL', targetId)) throw new ApiError('这个模型已删除，请刷新后重新添加', 404);

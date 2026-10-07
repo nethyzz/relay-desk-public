@@ -40,11 +40,19 @@ export function defaultRequestModel(protocol: Protocol, claimedModel: string, ba
 export function plannedRequests(protocol: Protocol, tier: Tier) { const logical = BASELINES[protocol].counts[tier]; return { logical, maximum: logical + Math.ceil(logical / 2) }; }
 export function comparisonKey(run: Run) { const s = run.snapshot; const b = run.report?.benchmark; return [run.target_id, s.request_model, s.claimed_model, s.protocol, s.tier, b?.id || s.baseline_id, b?.version || s.baseline_version, b?.content_sha256 || s.baseline_sha256].join('|'); }
 export function appliesTo(run: Run, target: Target, endpoint: Endpoint) { const s = run.snapshot; return s.endpoint_id === endpoint.id && s.base_url === endpoint.base_url && s.protocol === target.protocol && s.request_model === target.request_model && s.claimed_model === target.claimed_model; }
-export type TargetFilter = { kind: 'group' | 'station'; value: string };
-export function endpointsInScope(endpoints: Endpoint[], filter: TargetFilter) { return endpoints.filter(endpoint => filter.value === 'all' || (filter.kind === 'group' ? endpoint.group_id : endpoint.base_url) === filter.value); }
+export type TargetFilterKind = 'group' | 'station' | 'model';
+export type TargetFilter = { kind: TargetFilterKind; value: string };
+export function endpointsInScope(endpoints: Endpoint[], filter: TargetFilter, targets: Target[] = []) {
+ if (filter.value === 'all') return endpoints;
+ if (filter.kind === 'model') {
+  const selected = new Set(targets.filter(target => target.claimed_model === filter.value).map(target => target.endpoint_id));
+  return endpoints.filter(endpoint => selected.has(endpoint.id));
+ }
+ return endpoints.filter(endpoint => (filter.kind === 'group' ? endpoint.group_id : endpoint.base_url) === filter.value);
+}
 export function targetsInScope(targets: Target[], endpoints: Endpoint[], filter: TargetFilter) {
- const selected = new Set(endpointsInScope(endpoints, filter).map(endpoint => endpoint.id));
- return targets.filter(target => selected.has(target.endpoint_id));
+ const selected = new Set(endpointsInScope(endpoints, filter, targets).map(endpoint => endpoint.id));
+ return targets.filter(target => selected.has(target.endpoint_id) && (filter.kind !== 'model' || filter.value === 'all' || target.claimed_model === filter.value));
 }
 export function targetsInGroup(targets: Target[], endpoints: Endpoint[], groupId: string) { return targetsInScope(targets, endpoints, { kind: 'group', value: groupId }); }
 export function recipientAddresses(value: string) { return [...new Set(value.trim().split(/[\s,;，；]+/).filter(Boolean).map(address => address.toLowerCase()))]; }

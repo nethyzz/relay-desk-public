@@ -1,8 +1,8 @@
 # Relay Desk 本地应用：安装、备份与清理
 
-本地应用版本 1.1.0；对应公开源码发行版 v1.3.0，发布日期 2026-10-07。两者分别编号。
+本地应用版本 1.1.1；对应公开源码发行版 v1.4.0，发布日期 2026-10-07。两者分别编号。
 
-软件从 [GitHub Release](https://github.com/nethyzz/relay-desk-public/releases/tag/v1.3.0) 下载。Mac 推荐选择 `Relay-Desk-1.1.0-macos-arm64.dmg`；ZIP 为同一应用。源码仓库提供共享工程，Release 还提供带固定离线运行资源的源码 ZIP。
+软件从 [GitHub Release](https://github.com/nethyzz/relay-desk-public/releases/tag/v1.4.0) 下载。Mac 推荐选择 `Relay-Desk-1.1.1-macos-arm64.dmg`。源码仓库提供共享工程，Release 还提供带固定离线运行资源的源码 ZIP。
 
 ## 运行方式与当前交付
 
@@ -12,7 +12,7 @@
 
 | 平台 | 当前状态 | 安装要求 |
 | --- | --- | --- |
-| macOS | 已生成 Apple Silicon `.app`、`.app.zip` 和 `.dmg`；本机原生窗口验证已完成 | Apple Silicon Mac，macOS 13.3 或更新版本；个人构建，尚未做 Developer ID 签名和公证 |
+| macOS | 已发布 Apple Silicon 1.1.1 DMG，安装包完整性与严格签名校验通过 | Apple Silicon Mac，macOS 13.3 或更新版本；个人构建，尚未做 Developer ID 签名和公证 |
 | Windows | 共享应用源码、NSIS 安装和卸载配置已加入；尚未生成或验证 `.exe` | 在 Windows 上安装构建依赖后生成安装程序；运行使用系统 WebView2 |
 | Android | 共享应用源码和禁止自动备份、设备迁移的规则已加入；尚未生成或验证 APK | 需要 Android SDK、NDK 和 Gradle；运行设备需较新的 Android System WebView |
 | iPhone / iPad | 共享应用源码、iOS 16.4 最低版本和私有数据备份排除逻辑已加入；尚未生成或签名 `.ipa` | 完整 Xcode、Apple 账号和签名；需要 iOS / iPadOS 16.4 或更新版本 |
@@ -21,15 +21,27 @@
 
 ## Mac 安装与使用
 
-1. 从 Release 下载并打开 `Relay-Desk-1.1.0-macos-arm64.dmg`，将 Relay Desk 拖入“应用程序”；也可以解压 `Relay-Desk-1.1.0-macos-arm64.app.zip` 后放入“应用程序”。
+1. 从 Release 下载并打开 `Relay-Desk-1.1.1-macos-arm64.dmg`，将 Relay Desk 拖入“应用程序”。
 2. 启动 Relay Desk，在“站点与模型”添加 HTTPS 地址和自己的 Key，再添加检测模型。
 3. 设置页可以调整预算和邮件通知、导出加密备份、清理界面缓存或清空本机数据。
 
 最终使用者无需安装 Python、Node、Rust 或这些开发 SDK。当前包使用本地 ad-hoc 签名，没有 Developer ID 签名和 Apple 公证；若复制到其他 Mac 后系统要求批准，应由使用者在系统安全设置中核实并操作。此包只支持 Apple Silicon，Intel Mac 需要在对应目标上另行构建。[Tauri 官方签名说明](https://v2.tauri.app/distribute/sign/macos/#ad-hoc-signing)
 
-建议从 DMG 安装。文稿目录的系统同步服务会给散装 `.app` 添加 Finder 元数据；本次已对 ZIP 解压后和 DMG 挂载后的应用分别完成严格签名校验，两个安装包的可执行文件一致。
+建议从 DMG 安装。文稿目录的系统同步服务会给散装 `.app` 添加 Finder 元数据；本次已对 DMG 完整性和挂载后的应用完成严格签名校验。
 
 检测期间会占用运行内存；正常退出会停止检测、保存进度并结束应用进程。强制退出、设备关机或系统杀进程后，下次启动会把中断任务结束，保留已经保存的部分证据。无法确认的请求按预留上限保守计入预算，避免漏记已消耗的请求。
+
+## 从旧版更新与新增功能
+
+更新前在设置导出加密备份，正常退出，再使用 1.1.1 DMG 替换“应用程序”中的旧版本。应用标识与正式数据目录不变；启动时自动应用第 9 个迁移，保留原配置和历史报告。
+
+1.1.1 新增按检测模型筛选、可搜索的模型菜单，以及跨站点、跨分组复制模型配置。复制沿用来源 URL / Key、协议、档位与监测计划；保存不立即检测，继承的已启用监测之后会运行。详细操作见 [使用指南](USAGE.md#跨站点复制模型配置)。
+
+## Windows 开发交接
+
+Release 提供 `Relay-Desk-1.1.1-Windows-development.zip`，包含共享工程、固定检测器与六份基准、离线运行资源、依赖锁、许可证和逐文件 SHA-256 清单。它是开发源码包，尚未包含 Windows EXE。
+
+解压到工程根目录后先运行 `node scripts/verify-handoff.mjs`。构建步骤见 [Windows 开发交接](windows-handoff.md)，可复制的开发任务说明见 [任务示例](windows-codex-prompt.md)，验证范围见 [交接验证记录](windows-handoff-validation.md)。开发依赖仍需另行准备；运行资源离线提供不代表整套开发工具链均可离线安装。
 
 ## iPhone 做出来后如何安装
 
@@ -140,14 +152,14 @@ npm run app:clean -- --all --apply         # 按清单清理
 
 这不会清理原项目开发环境。清理专用 Rust 工具链和 Android SDK 后，再次构建需要重新准备工具；已生成安装包仍可独立运行。
 
-## 已完成的验证
+## 验证范围
 
-- 120 项 TypeScript 测试、36 项 Python 测试通过。
+- 133 项 TypeScript 测试、36 项 Python 测试通过。
 - 18 组原版 Python / Pyodide 检测结果对照和 4 组原生协议传输、取消对照通过；未调用真实模型 API。
 - 9 项原生 Rust 文件保护、运行锁、恢复记录、Apple 备份排除和导出临时文件清理测试通过。
-- Mac 原生窗口的启动、设置与模型保存、重启保留、清理缓存保留数据、密码加密备份导出与正常退出通过；虚拟测试 Key 已验证加密与解密，备份文件已解密检查 SQLite 文件头和密钥长度。
-- Mac 的 DMG 和 ZIP 内应用均通过 `codesign --verify --deep --strict`，安装包大小和 SHA-256 已核验。
-- Mac 卸载清理脚本已在本次创建的空白测试数据上执行；专属数据库、WebView 缓存和偏好文件已删除，App 安装包与原项目数据保留。
+- 既有 Mac 原生流程验证：启动、设置与模型保存、重启保留、清理缓存保留数据、密码加密备份导出与正常退出通过；虚拟测试 Key 已验证加密与解密，备份文件已解密检查 SQLite 文件头和密钥长度。
+- Mac 1.1.1 的 DMG 内应用通过 `codesign --verify --deep --strict`，安装包大小和 SHA-256 已核验。
+- Mac 卸载清理脚本此前已在空白测试数据上执行；专属数据库、WebView 缓存和偏好文件已删除，App 安装包与原项目数据保留。
 - 窄屏浏览器预览通过；Android、Windows、iPhone 的安装与真机完整检测尚未完成。没有发送真实邮件，没有发布到应用商店。
 
 固定检测器与基准保持原版，仍受上游 PolyForm Noncommercial 1.0.0 许可约束。此交付用于个人非商业使用，第三方署名与许可随包提供。

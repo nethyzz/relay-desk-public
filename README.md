@@ -14,7 +14,7 @@ Relay Desk 提供界面、配置管理、任务调度、预算控制与通知；
 
 [下载软件](#下载与安装本地应用) · [源码快速开始](#快速开始) · [使用指南](docs/USAGE.md) · [应用安装与备份](docs/cross-platform-apps.md) · [云端部署](docs/DEPLOYMENT.md) · [原作者与第三方声明](THIRD_PARTY_NOTICES.md)
 
-当前发布：[v1.3.0 · 本地应用](https://github.com/nethyzz/relay-desk-public/releases/tag/v1.3.0)。本次公开源码版本为 1.3.0，随附已在本机制作并验证的本地应用 1.1.0；两者分别编号。原有网页模式继续提供，更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前发布：[v1.4.0 · 本地应用](https://github.com/nethyzz/relay-desk-public/releases/tag/v1.4.0)。本次公开源码版本为 1.4.0，随附已在本机制作并验证的本地应用 1.1.1；两者分别编号。原有网页模式继续提供，更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 下载与安装本地应用
 
@@ -22,9 +22,9 @@ Relay Desk 提供界面、配置管理、任务调度、预算控制与通知；
 
 | 下载 | 适用范围 |
 | --- | --- |
-| [Mac 安装包（DMG，推荐）](https://github.com/nethyzz/relay-desk-public/releases/download/v1.3.0/Relay-Desk-1.1.0-macos-arm64.dmg) | Apple Silicon Mac（M 系列），macOS 13.3 或更新版本 |
-| [Mac 应用 ZIP](https://github.com/nethyzz/relay-desk-public/releases/download/v1.3.0/Relay-Desk-1.1.0-macos-arm64.app.zip) | 与 DMG 相同的应用，可解压后放入“应用程序” |
-| [共享应用源码与离线运行资源](https://github.com/nethyzz/relay-desk-public/releases/download/v1.3.0/relay-desk-v1.3.0-native-source.zip) | 面向开发者；Windows、Android、iPhone 尚未交付安装包 |
+| [Mac 安装包（DMG，推荐）](https://github.com/nethyzz/relay-desk-public/releases/download/v1.4.0/Relay-Desk-1.1.1-macos-arm64.dmg) | Apple Silicon Mac（M 系列），macOS 13.3 或更新版本 |
+| [Windows 开发交接包](https://github.com/nethyzz/relay-desk-public/releases/download/v1.4.0/Relay-Desk-1.1.1-Windows-development.zip) | 完整共享工程与离线运行资源；需要在 Windows 构建，尚无 EXE |
+| [共享应用源码与离线运行资源](https://github.com/nethyzz/relay-desk-public/releases/download/v1.4.0/relay-desk-v1.4.0-native-source.zip) | 面向开发者；Windows、Android、iPhone 尚未交付安装包 |
 
 1. 下载 DMG，打开后将 Relay Desk 拖入“应用程序”，再启动应用。
 2. 在「站点与模型」添加自己的 HTTPS API 地址、Key 和检测模型，再在总览发起检测。
@@ -32,9 +32,9 @@ Relay Desk 提供界面、配置管理、任务调度、预算控制与通知；
 
 本包使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple 公证。系统若阻止首次打开，请核对下载来源与 SHA-256，并按系统「隐私与安全性」提示操作。安装、备份、数据目录和卸载步骤见 [本地应用指南](docs/cross-platform-apps.md)；下载校验值随 Release 提供。
 
-随附 [第三方许可包](https://github.com/nethyzz/relay-desk-public/releases/download/v1.3.0/THIRD_PARTY_LICENSES.zip) 保留原作者与依赖声明。软件包含 chen-006 及贡献者的 meow 4.5.4 原版内核，按 PolyForm Noncommercial 1.0.0 用于个人非商业使用。
+随附 [第三方许可包](https://github.com/nethyzz/relay-desk-public/releases/download/v1.4.0/THIRD_PARTY_LICENSES.zip) 保留原作者与依赖声明。软件包含 chen-006 及贡献者的 meow 4.5.4 原版内核，按 PolyForm Noncommercial 1.0.0 用于个人非商业使用。
 
-**自动监测需要应用保持打开；手机检测需要保持前台。** 退出、休眠或系统终止后不保证继续执行。Windows、Android 和 iPhone / iPad 当前提供共享工程与构建说明，尚未完成相应平台的安装与真机验证。
+**自动监测需要应用保持打开；手机检测需要保持前台。** 退出、休眠或系统终止后不保证继续执行。Windows、Android 和 iPhone / iPad 当前提供共享工程与构建说明，尚未完成相应平台的安装与真机验证。Windows 交接与构建步骤见 [Windows 开发指南](docs/windows-handoff.md)。
 
 ![Mac 本地应用界面，使用虚拟测试数据](docs/assets/mac-app.png)
 
@@ -43,6 +43,8 @@ Relay Desk 提供界面、配置管理、任务调度、预算控制与通知；
 | 功能 | 说明 |
 | --- | --- |
 | 多站点与多 Key | 同一中转站可保存多条独立 Key，各自管理分组和模型 |
+| 模型筛选与搜索 | 按分组、中转站或检测模型查看；模型菜单支持搜索与自定义名称 |
+| 跨站点复制 | 勾选不同站点、分组的配置，预览后为新检测模型复制；复用原 URL / Key，保留原配置和报告 |
 | 配置删除 | 预览后删除中转站、Key 或模型，清理关联监测与组合，保留历史报告 |
 | 四种 API 协议 | GPT Responses、GPT Chat 兼容、Claude Messages、Claude Chat 兼容 |
 | 单次与批量检测 | 可提交整个筛选范围或任意组合，自动拆分为每批最多 20 个目标，按队列依次执行 |
@@ -102,6 +104,8 @@ npm run setup:local -- --proxy http://127.0.0.1:你的代理端口
 4. 在总览查看进度，打开报告查看结论、判定线和有效样本。真实请求费用由自己的模型 API 账户承担。
 
 可以一次提交超过 20 个模型；后台会分批执行，并在整个选择完成后汇总通知。应用不再设固定的目标数量上限，实际规模仍受平台存储与请求容量约束。暂停本次任务后，已有证据保留；再次检测会从头开始，后续定时监测计划不受影响。
+
+在总览与「站点与模型」可按检测模型筛选；模型选择菜单支持搜索。在总览或站点页的批量选择中勾选来源配置并点击「复制为其他模型」，核对新模型和逐项请求别名后保存。复制继承原监测开关与计划：保存动作不发起检测，已开启的计划之后会按时运行。操作步骤见 [使用指南](docs/USAGE.md#跨站点复制模型配置)。
 
 在「站点与模型」或对应编辑窗口中可删除不再使用的配置。确认窗口会列出受影响的 Key、模型和监测计划；正在检测的目标需要先停止并等待结束。删除配置后历史报告仍可查看、导出。
 

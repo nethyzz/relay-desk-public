@@ -43,8 +43,10 @@ try {
   console.error(String(error).slice(-4000));
   process.exitCode = 1;
 }
-// The WASM event loop can keep Node alive after all awaited checks finish.
-// Flush the CLI output, then preserve the success or failure exit status.
+
+// Pyodide's scheduler can leave Node timers alive after every comparison has
+// completed. This standalone verifier has no application state to preserve.
+// Flush diagnostics before ending the process, including its WASM resources.
 await new Promise(resolve => process.stdout.write('', resolve));
 await new Promise(resolve => process.stderr.write('', resolve));
-process.exit(process.exitCode ?? 0);
+process.exit(process.exitCode || 0);
